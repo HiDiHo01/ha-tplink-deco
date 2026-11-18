@@ -2,14 +2,13 @@ from homeassistant.components.device_tracker.const import CONF_SCAN_INTERVAL
 from homeassistant.components.select import SelectEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import COORDINATOR_DECOS_KEY
-from .const import DOMAIN
+from .const import COORDINATOR_DECOS_KEY, DOMAIN
 from .device import create_device_info
 
-POLLING_INTERVAL_OPTIONS = ["10", "30", "60", "120"]
+POLLING_INTERVAL_OPTIONS = ["5", "10", "30", "60", "120", "180", "240", "300"]
 
 
 async def async_setup_entry(
@@ -30,7 +29,7 @@ class DecoPollingIntervalSelect(SelectEntity):
     _attr_icon = "mdi:timer-cog"
     _attr_options = POLLING_INTERVAL_OPTIONS
 
-    def __init__(self, hass: HomeAssistant, config_entry: ConfigEntry, coordinator):
+    def __init__(self, hass: HomeAssistant, config_entry: ConfigEntry, coordinator) -> None:
         self.hass = hass
         self.config_entry = config_entry
         self.coordinator = coordinator
@@ -48,7 +47,7 @@ class DecoPollingIntervalSelect(SelectEntity):
         master_deco = self.coordinator.data.master_deco
         if master_deco is None:
             return None
-        return create_device_info(master_deco, master_deco, self.coordinator)
+        return create_device_info(master_deco, master_deco)
 
     async def async_select_option(self, option: str) -> None:
         """Change polling interval."""

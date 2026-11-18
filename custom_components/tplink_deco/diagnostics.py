@@ -1,50 +1,42 @@
-"""Privacy-preserving Home Assistant diagnostics for the TP-Link Deco integration."""
+"""Diagnostics support for TP-Link Deco."""
 
+from datetime import datetime
 from typing import Any
 
+from homeassistant.components.diagnostics import async_redact_data
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import CONF_HOST
+from homeassistant.const import CONF_PASSWORD
+from homeassistant.const import CONF_USERNAME
 from homeassistant.core import HomeAssistant
 
 from .const import COORDINATOR_CLIENTS_KEY
 from .const import COORDINATOR_DECOS_KEY
-from .const import COORDINATOR_MOBILE_KEY
-from .const import COORDINATOR_WIRELESS_KEY
 from .const import DOMAIN
-from .coordinator import CoordinatorHealth
+from .coordinator import TpLinkDeco
+from .coordinator import TpLinkDecoClient
 from .coordinator import TplinkDecoClientUpdateCoordinator
 from .coordinator import TplinkDecoUpdateCoordinator
 
-
-def _health_snapshot(health: CoordinatorHealth) -> dict[str, Any]:
-    """Export only measured health values, never API exception messages."""
-    last_error = health.last_error
-    if (
-        not isinstance(last_error, str)
-        or len(last_error) > 80
-        or (last_error != "0" and not last_error.isidentifier())
-    ):
-        last_error = "UnknownError"
-
-    return {
-        "last_successful_update": (
-            health.last_successful_update.isoformat()
-            if health.last_successful_update is not None
-            else None
-        ),
-        "response_time_ms": health.response_time_ms,
-        "timeout_count": health.timeout_count,
-        "consecutive_failures": health.consecutive_failures,
-        "last_error": last_error,
-    }
+TO_REDACT = {
+    CONF_HOST,
+    CONF_PASSWORD,
+    CONF_USERNAME,
+    "access_token",
+    "cookie",
+    "refresh_token",
+    "secret",
+    "session",
+    "session_id",
+    "stok",
+    "token",
+}
 
 
-def _coordinator_snapshot(
-    coordinator: TplinkDecoUpdateCoordinator | TplinkDecoClientUpdateCoordinator,
-) -> dict[str, Any]:
-    """Describe existing coordinator health without triggering an API refresh."""
+def _coordinator_diagnostics(coordinator) -> dict[str, Any]:
+    """Return non-sensitive coordinator state."""
     update_interval = coordinator.update_interval
     return {
-        **_health_snapshot(coordinator.health),
         "last_update_success": coordinator.last_update_success,
         "update_interval_seconds": (
             update_interval.total_seconds() if update_interval is not None else None
@@ -52,61 +44,84 @@ def _coordinator_snapshot(
     }
 
 
+def _deco_diagnostics(deco: TpLinkDeco, identifier: str) -> dict[str, Any]:
+    """Return diagnostics for a Deco without personal identifiers."""
+    return {
+        "id": identifier,
+        "device_model": deco.device_model,
+        "hardware_version": deco.hw_version,
+        "software_version": deco.sw_version,
+        "online": deco.online,
+        "internet_online": deco.internet_online,
+        "master": deco.master,
+        "connection_type": deco.connection_type,
+        "interface": deco.interface,
+        "signal_2_4_ghz": deco.signal_band2_4,
+        "signal_5_ghz": deco.signal_band5,
+        "backhaul_speed": deco.backhaul_speed,
+        "backhaul_max_speed": deco.backhaul_max_speed,
+        "cpu_usage": deco.cpu_usage,
+        "cpu_usage_raw": deco.cpu_usage_raw,
+        "memory_usage": deco.mem_usage,
+        "memory_usage_raw": deco.mem_usage_raw,
+    }
+
+
+def _client_diagnostics(
+    client: TpLinkDecoClient,
+    identifier: str,
+    deco_ids: dict[str, str],
+) -> dict[str, Any]:
+    """Return diagnostics for a client without personal identifiers."""
+    last_activity: datetime | None = client.last_activity
+    return {
+        "id": identifier,
+        "deco_id": deco_ids.get(client.deco_mac, "unassigned"),
+        "online": client.online,
+        "connection_type": client.connection_type,
+        "interface": client.interface,
+        "down_kilobytes_per_s": client.down_kilobytes_per_s,
+        "up_kilobytes_per_s": client.up_kilobytes_per_s,
+        "last_activity": last_activity.isoformat() if last_activity else None,
+    }
+
+
 async def async_get_config_entry_diagnostics(
     hass: HomeAssistant, config_entry: ConfigEntry
 ) -> dict[str, Any]:
-    """Return anonymized, JSON-safe diagnostics for one configuration entry."""
+    """Return diagnostics for a config entry."""
     data = hass.data[DOMAIN][config_entry.entry_id]
     deco_coordinator: TplinkDecoUpdateCoordinator = data[COORDINATOR_DECOS_KEY]
     client_coordinator: TplinkDecoClientUpdateCoordinator = data[
         COORDINATOR_CLIENTS_KEY
     ]
 
-    deco_data = deco_coordinator.data
-    decos = deco_data.decos if deco_data is not None else {}
-    clients = client_coordinator.data or {}
+    decos = sorted(deco_coordinator.data.decos.items())
+    clients = sorted(client_coordinator.data.items())
+    deco_ids = {mac: f"deco_{index}" for index, (mac, _) in enumerate(decos, 1)}
 
-    result = {
-        "schema_version": 1,
+    return {
+        "config_entry": {
+            "version": config_entry.version,
+            "minor_version": config_entry.minor_version,
+            "data": async_redact_data(config_entry.data, TO_REDACT),
+            "options": async_redact_data(config_entry.options, TO_REDACT),
+        },
         "deco_coordinator": {
-            **_coordinator_snapshot(deco_coordinator),
+            **_coordinator_diagnostics(deco_coordinator),
             "paused": deco_coordinator.paused,
-            "device_list_interval_seconds": (
-                deco_coordinator.device_list_interval_seconds
+            "master_deco_id": (
+                deco_ids.get(deco_coordinator.data.master_deco.mac)
+                if deco_coordinator.data.master_deco is not None
+                else None
             ),
-            "known_decos": len(decos),
-            "online_decos": sum(bool(deco.online) for deco in decos.values()),
-            "master_present": (
-                deco_data is not None and deco_data.master_deco is not None
-            ),
+            "decos": [_deco_diagnostics(deco, deco_ids[mac]) for mac, deco in decos],
         },
         "client_coordinator": {
-            **_coordinator_snapshot(client_coordinator),
-            "query_mode": client_coordinator.client_query_mode,
-            "backoff_remaining_seconds": client_coordinator.remaining_backoff_seconds,
-            "has_successful_refresh": client_coordinator.has_successful_refresh,
-            "known_clients": len(clients),
-            "online_clients": sum(bool(client.online) for client in clients.values()),
+            **_coordinator_diagnostics(client_coordinator),
+            "clients": [
+                _client_diagnostics(client, f"client_{index}", deco_ids)
+                for index, (_, client) in enumerate(clients, 1)
+            ],
         },
     }
-    wireless_coordinator = data.get(COORDINATOR_WIRELESS_KEY)
-    if wireless_coordinator is not None:
-        result["wireless_coordinator"] = {
-            "last_update_success": wireless_coordinator.last_update_success,
-            "retry_remaining_seconds": wireless_coordinator.retry_remaining_seconds,
-            "available_networks": sorted(wireless_coordinator.data or {}),
-        }
-    mobile_coordinator = data.get(COORDINATOR_MOBILE_KEY)
-    if mobile_coordinator is not None:
-        master = getattr(deco_data, "master_deco", None)
-        interval = mobile_coordinator.update_interval
-        result["mobile_data_coordinator"] = {
-            "last_update_success": mobile_coordinator.last_update_success,
-            "supported": bool(
-                master is not None and mobile_coordinator.has_current_usage(master.mac)
-            ),
-            "update_interval_seconds": (
-                interval.total_seconds() if interval is not None else None
-            ),
-        }
-    return result

@@ -1,44 +1,11 @@
-from homeassistant.components.switch import DOMAIN as SWITCH_DOMAIN
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import entity_registry as er
-from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import COORDINATOR_DECOS_KEY
-from .const import DOMAIN
+from .const import COORDINATOR_DECOS_KEY, DOMAIN
 from .device import create_device_info
-
-LEGACY_POLLING_UNIQUE_ID = "tplink_deco_polling"
-
-
-def polling_unique_id(config_entry_id: str) -> str:
-    """Return the polling switch unique ID for a single config entry."""
-    return f"{LEGACY_POLLING_UNIQUE_ID}_{config_entry_id}"
-
-
-def _migrate_polling_switch_unique_id(
-    hass: HomeAssistant, config_entry: ConfigEntry
-) -> None:
-    """Migrate only this entry's legacy switch, preserving its entity ID."""
-    registry = er.async_get(hass)
-    legacy_entity_id = registry.async_get_entity_id(
-        SWITCH_DOMAIN, DOMAIN, LEGACY_POLLING_UNIQUE_ID
-    )
-    if legacy_entity_id is None:
-        return
-
-    legacy_entry = registry.async_get(legacy_entity_id)
-    if legacy_entry is None or legacy_entry.config_entry_id != config_entry.entry_id:
-        return
-
-    new_unique_id = polling_unique_id(config_entry.entry_id)
-    # A scoped switch already in the registry must never be overwritten.
-    if registry.async_get_entity_id(SWITCH_DOMAIN, DOMAIN, new_unique_id) is not None:
-        return
-
-    registry.async_update_entity(legacy_entity_id, new_unique_id=new_unique_id)
 
 
 async def async_setup_entry(
@@ -49,29 +16,33 @@ async def async_setup_entry(
     """Set up switch."""
     coordinator = hass.data[DOMAIN][config_entry.entry_id][COORDINATOR_DECOS_KEY]
 
-    _migrate_polling_switch_unique_id(hass, config_entry)
-    async_add_entities([DecoPollingSwitch(coordinator)])
+    # async_add_entities([DecoPollingSwitch(coordinator)])
+    async_add_entities([DecoPollingSwitch(hass, config_entry, coordinator)])
 
 
 class DecoPollingSwitch(SwitchEntity):
     """Switch to control Deco polling."""
 
-    def __init__(self, coordinator) -> None:
+    def __init__(self, hass: HomeAssistant, config_entry: ConfigEntry, coordinator) -> None:
+        self.hass = hass
+        self.config_entry = config_entry
         self.coordinator = coordinator
         self._attr_name = "Polling"
-        self._attr_unique_id = polling_unique_id(coordinator.config_entry.entry_id)
+        # self._attr_unique_id = "tplink_deco_polling"
         self._attr_icon = "mdi:lan-connect"
+        self._attr_unique_id = f"{config_entry.entry_id}_polling"
 
     @property
-    def device_info(self) -> DeviceInfo:
+    def device_info(self) -> DeviceInfo | None:
         """Attach switch to the master Deco device."""
         master_deco = self.coordinator.data.master_deco
-        return create_device_info(master_deco, master_deco, self.coordinator)
+        return create_device_info(master_deco, master_deco)
 
     @property
     def is_on(self) -> bool:
         """Return True if polling is active."""
         return not self.coordinator.paused
+        # return True
 
     async def async_turn_off(self, **kwargs):
         """Pause polling."""

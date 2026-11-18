@@ -7,8 +7,7 @@
           "host": "Host",
           "username": "Username",
           "password": "Password",
-          "interval_seconds": "Seconds between updates",
-          "device_list_interval": "Seconds between Deco status updates (0 = startup only)",
+          "scan_interval": "Seconds between updates",
           "consider_home": "Seconds to wait before marking a device tracker as not home after it is no longer seen.",
           "timeout_seconds": "Timeout seconds",
           "timeout_error_retries": "Timeout error retry count",
@@ -16,9 +15,7 @@
           "client_prefix": "Client name prefix",
           "client_postfix": "Client name postfix",
           "deco_prefix": "Deco name prefix",
-          "deco_postfix": "Deco name postfix",
-          "link_client_devices": "Link client trackers to devices by MAC address",
-          "expose_wifi_ssids": "Show WiFi network names on the WiFi status sensors"
+          "deco_postfix": "Deco name postfix"
         }
       },
       "reauth_confirm": {
@@ -36,10 +33,7 @@
       "invalid_auth": "Invalid authentication",
       "invalid_host": "Unable to connect to host.",
       "timeout_connect": "Timeout establishing connection",
-      "unknown": "Unexpected error",
-      "invalid_scan_interval": "Select a polling interval of 10, 30, 60, or 120 seconds.",
-      "invalid_device_list_interval": "Enter 0 for startup-only, or at least 10 seconds for Deco status updates.",
-      "invalid_expose_wifi_ssids": "Select on or off to control WiFi network name exposure."
+      "unknown": "Unexpected error"
     }
   },
   "options": {
@@ -50,8 +44,7 @@
           "host": "Host",
           "username": "Username",
           "password": "Password",
-          "interval_seconds": "Seconds between updates",
-          "device_list_interval": "Seconds between Deco status updates (0 = startup only)",
+          "scan_interval": "Seconds between updates",
           "consider_home": "Seconds to wait before marking a device tracker as not home after it is no longer seen.",
           "timeout_seconds": "Timeout seconds",
           "timeout_error_retries": "Timeout error retry count",
@@ -59,9 +52,7 @@
           "client_prefix": "Client name prefix",
           "client_postfix": "Client name postfix",
           "deco_prefix": "Deco name prefix",
-          "deco_postfix": "Deco name postfix",
-          "link_client_devices": "Link client trackers to devices by MAC address",
-          "expose_wifi_ssids": "Show WiFi network names on the WiFi status sensors"
+          "deco_postfix": "Deco name postfix"
         }
       }
     },
@@ -72,17 +63,15 @@
       "invalid_auth": "Invalid authentication",
       "invalid_host": "Unable to connect to host.",
       "timeout_connect": "Timeout establishing connection",
-      "unknown": "Unexpected error",
-      "invalid_scan_interval": "Select a polling interval of 10, 30, 60, or 120 seconds.",
-      "invalid_device_list_interval": "Enter 0 for startup-only, or at least 10 seconds for Deco status updates.",
-      "invalid_expose_wifi_ssids": "Select on or off to control WiFi network name exposure."
+      "unknown": "Unexpected error"
     }
   },
   "entity": {
-    "sensor": {
-      "mobile_data_usage": {
-        "name": "Mobile data usage"
+    "button": {
+      "reboot": {
+        "name": "Reboot"
       }
     }
   }
+
 }

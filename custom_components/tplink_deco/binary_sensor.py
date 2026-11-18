@@ -1,263 +1,230 @@
-"""Binary sensors for TP-Link Deco."""
+from __future__ import annotations
 
-from homeassistant.components.binary_sensor import BinarySensorEntity
+import logging
+from collections.abc import Callable
+from dataclasses import dataclass
+
+from homeassistant.components.binary_sensor import (
+    BinarySensorDeviceClass,
+    BinarySensorEntity,
+    BinarySensorEntityDescription,
+)
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory
-from homeassistant.core import HomeAssistant
-from homeassistant.core import callback
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import COORDINATOR_DECOS_KEY
-from .const import COORDINATOR_WIRELESS_KEY
-from .const import DOMAIN
-from .const import SIGNAL_DECO_ADDED
-from .coordinator import TpLinkDeco
-from .coordinator import TplinkDecoUpdateCoordinator
+from .api import wireless_is_enabled
+from .const import COORDINATOR_DECOS_KEY, DOMAIN, SIGNAL_DECO_ADDED, WIFI_NETWORKS
+from .coordinator import TpLinkDeco, TplinkDecoUpdateCoordinator
 from .device import create_device_info
-from .wireless import TplinkDecoWirelessUpdateCoordinator
-from .wireless import WIRELESS_NETWORKS
-from .wireless import WirelessNetworkDescription
-from .wireless import wireless_ssid_attributes
+
+_LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, kw_only=True)
+class TplinkDecoBinarySensorDescription(BinarySensorEntityDescription):
+    """Description of a TP-Link Deco binary sensor."""
+
+    value_fn: Callable[[TpLinkDeco], bool | None]
+
+
+BINARY_SENSOR_DESCRIPTIONS: tuple[TplinkDecoBinarySensorDescription, ...] = (
+    TplinkDecoBinarySensorDescription(
+        key="internet_online",
+        name="Internet online",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        device_class=BinarySensorDeviceClass.CONNECTIVITY,
+        value_fn=lambda deco: deco.internet_online,
+    ),
+    TplinkDecoBinarySensorDescription(
+        key="online",
+        name="Deco online",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        device_class=BinarySensorDeviceClass.CONNECTIVITY,
+        value_fn=lambda deco: deco.online,
+    ),
+)
 
 
 async def async_setup_entry(
-    hass: HomeAssistant, entry: ConfigEntry, async_add_entities
-):
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
     """Set up binary sensor platform."""
-    data = hass.data[DOMAIN][entry.entry_id]
-    coordinator_decos = data[COORDINATOR_DECOS_KEY]
+    coordinator: TplinkDecoUpdateCoordinator = hass.data[DOMAIN][entry.entry_id][COORDINATOR_DECOS_KEY]
 
-    tracked_decos = set()
-
-    def add_binary_sensors_for_deco(deco: TpLinkDeco) -> None:
-        async_add_entities(
-            [
-                TplinkDecoInternetOnlineBinarySensor(
-                    coordinator_decos,
-                    deco.mac,
-                ),
-                TplinkDecoOnlineBinarySensor(
-                    coordinator_decos,
-                    deco.mac,
-                ),
-            ]
-        )
+    tracked_macs: set[str] = set()
 
     @callback
-    def add_untracked_deco_binary_sensors() -> None:
-        """Add binary sensors for newly discovered decos."""
-        for mac, deco in coordinator_decos.data.decos.items():
-            if mac in tracked_decos:
-                continue
+    def _add_untracked_deco_binary_sensors() -> None:
+        """Add binary sensor entities for newly discovered Deco devices."""
 
-            add_binary_sensors_for_deco(deco)
-            tracked_decos.add(mac)
+        new_entities: list[BinarySensorEntity] = []
 
-    add_untracked_deco_binary_sensors()
-
-    coordinator_decos.on_close(
-        async_dispatcher_connect(
-            hass, SIGNAL_DECO_ADDED, add_untracked_deco_binary_sensors
+        # for mac, deco in coordinator.data.decos.items():
+        _LOGGER.debug(
+            "Adding untracked Deco binary sensors: decos=%s tracked_macs=%s",
+            list(coordinator.data.decos),
+            sorted(tracked_macs),
         )
+        for mac in coordinator.data.decos:
+            if mac in tracked_macs:
+                _LOGGER.debug(
+                    "Skipping already tracked Deco binary sensors: mac=%s",
+                    mac,
+                )
+                continue
+            _LOGGER.debug(
+                "Creating binary sensors for Deco: mac=%s descriptions=%d",
+                mac,
+                len(BINARY_SENSOR_DESCRIPTIONS),
+            )
+            new_entities.extend(
+                TplinkDecoBinarySensor(coordinator, mac, description)
+                for description in BINARY_SENSOR_DESCRIPTIONS
+            )
+            tracked_macs.add(mac)
+
+        if new_entities:
+            async_add_entities(new_entities)
+
+    _add_untracked_deco_binary_sensors()
+
+    coordinator.on_close(
+        async_dispatcher_connect(hass, SIGNAL_DECO_ADDED, _add_untracked_deco_binary_sensors)
     )
 
-    wireless_coordinator = data.get(COORDINATOR_WIRELESS_KEY)
-    if wireless_coordinator is None:
+    _LOGGER.debug(
+        "WiFi binary sensors: master=%s decos=%s",
+        coordinator.data.master_deco.mac
+        if coordinator.data.master_deco is not None
+        else None,
+        list(coordinator.data.decos),
+    )
+    await _async_add_wifi_binary_sensors(coordinator, async_add_entities)
+
+
+async def _async_add_wifi_binary_sensors(coordinator, async_add_entities) -> None:
+    """Add read-only on/off status sensors for the Deco's WiFi networks.
+
+    Enabling/disabling WiFi is not supported by the Deco local API (the write
+    handler errors server-side), but reading the state works reliably.
+    """
+
+    _LOGGER.debug(
+        "Adding WiFi binary sensors: master=%s",
+        coordinator.data.master_deco.mac
+        if coordinator.data.master_deco is not None
+        else None,
+    )
+
+    # WiFi sensors attach to the master Deco; skip on satellite-only entries.
+    master_deco = coordinator.data.master_deco
+    if master_deco is None:
+        _LOGGER.debug("No master Deco for this entry, skipping WiFi status sensors")
         return
 
-    tracked_networks: set[tuple[str, str]] = set()
+    try:
+        config = await coordinator.api.async_get_wireless("wlan")
+    except Exception as err:  # noqa: BLE001 - skip sensors, don't fail setup
+        _LOGGER.warning("Could not read wireless config for WiFi sensors: %s", err)
+        return
 
-    @callback
-    def add_wireless_binary_sensors() -> None:
-        """Register only supported wireless networks once per master."""
-        master_deco = coordinator_decos.data.master_deco
-        if master_deco is None or not isinstance(wireless_coordinator.data, dict):
-            return
-
-        entities = []
-        for network in WIRELESS_NETWORKS:
-            identity = (master_deco.mac, network.key)
-            if (
-                network.key in wireless_coordinator.data
-                and identity not in tracked_networks
-            ):
-                entities.append(
-                    TplinkDecoWirelessBinarySensor(
-                        wireless_coordinator, coordinator_decos, master_deco, network
-                    )
-                )
-                tracked_networks.add(identity)
-
-        if entities:
-            async_add_entities(entities)
-
-    entry.async_on_unload(
-        wireless_coordinator.async_add_listener(add_wireless_binary_sensors)
-    )
-    coordinator_decos.on_close(
-        async_dispatcher_connect(hass, SIGNAL_DECO_ADDED, add_wireless_binary_sensors)
-    )
-    add_wireless_binary_sensors()
+    entities = []
+    for network in WIFI_NETWORKS:
+        if wireless_is_enabled(config, network["paths"]) is None:
+            continue
+        entities.append(
+            DecoWifiBinarySensor(
+                coordinator,
+                master_deco,
+                network,
+            )
+        )
+    async_add_entities(entities)
 
 
-class TplinkDecoInternetOnlineBinarySensor(CoordinatorEntity, BinarySensorEntity):
-    """TP-Link Deco internet online binary sensor."""
+class TplinkDecoBinarySensor(CoordinatorEntity[TplinkDecoUpdateCoordinator], BinarySensorEntity):
+    """TP-Link Deco binary sensor."""
 
     _attr_has_entity_name = True
-    _attr_name = "Internet online"
-    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    entity_description: TplinkDecoBinarySensorDescription
 
     def __init__(
         self,
-        coordinator_decos: TplinkDecoUpdateCoordinator,
+        coordinator: TplinkDecoUpdateCoordinator,
         deco_mac: str,
+        description: TplinkDecoBinarySensorDescription,
     ) -> None:
-        super().__init__(coordinator_decos)
+        super().__init__(coordinator)
         self._deco_mac = deco_mac
-        self._attr_unique_id = f"{deco_mac}_internet_online"
+        self.entity_description = description  # type: ignore[assignment]
+        self._attr_unique_id = f"{deco_mac}_{description.key}"
 
     @property
-    def _deco(self) -> TpLinkDeco | None:
-        """Return current deco object."""
-        return self.coordinator.data.decos.get(self._deco_mac)
+    def _deco(self) -> TpLinkDeco:
+        return self.coordinator.data.decos[self._deco_mac]
 
     @property
-    def is_on(self) -> bool:
-        """Return true if internet is online."""
-        deco = self._deco
-        if deco is None:
-            return False
-
-        value = deco.internet_online
-
-        if isinstance(value, str):
-            return value.lower() in ("online", "true", "1", "yes")
-
-        return bool(value)
+    def is_on(self) -> bool | None:  # type: ignore[override]
+        return self.entity_description.value_fn(self._deco)
 
     @property
-    def available(self) -> bool:
+    def available(self) -> bool:  # type: ignore[override]
+        # return self._deco is not None
         return True
 
     @property
-    def device_info(self):
-        """Return device info."""
-        deco = self._deco
-        if deco is None:
-            return None
-
-        return create_device_info(
-            deco,
-            self.coordinator.data.master_deco,
-            self.coordinator,
-        )
+    def device_info(self) -> DeviceInfo | None:  # type: ignore[override]
+        master_deco = self.coordinator.data.master_deco
+        return create_device_info(self._deco, master_deco)
 
 
-class TplinkDecoOnlineBinarySensor(CoordinatorEntity, BinarySensorEntity):
-    """TP-Link Deco online (mesh/backhaul) status."""
-
-    _attr_has_entity_name = True
-    _attr_name = "Deco online"
-    _attr_entity_category = EntityCategory.DIAGNOSTIC
-
-    def __init__(self, coordinator_decos, deco_mac):
-        super().__init__(coordinator_decos)
-        self._deco_mac = deco_mac
-        self._attr_unique_id = f"{deco_mac}_online"
-
-    @property
-    def _deco(self):
-        return self.coordinator.data.decos.get(self._deco_mac)
-
-    @property
-    def is_on(self):
-        deco = self._deco
-        if deco is None:
-            return False
-        return bool(deco.online)
-
-    @property
-    def available(self):
-        return True
-
-    @property
-    def device_info(self):
-        deco = self._deco
-        if deco is None:
-            return None
-
-        return create_device_info(
-            deco,
-            self.coordinator.data.master_deco,
-            self.coordinator,
-        )
-
-
-class TplinkDecoWirelessBinarySensor(CoordinatorEntity, BinarySensorEntity):
-    """Read-only enabled state for a known Deco WiFi network."""
+class DecoWifiBinarySensor(BinarySensorEntity):
+    """Read-only on/off status of one of the Deco's WiFi networks."""
 
     _attr_has_entity_name = True
 
     def __init__(
         self,
-        coordinator: TplinkDecoWirelessUpdateCoordinator,
-        deco_coordinator: TplinkDecoUpdateCoordinator,
+        coordinator: TplinkDecoUpdateCoordinator,
         master_deco: TpLinkDeco,
-        description: WirelessNetworkDescription,
+        network: dict[str, object],
     ) -> None:
-        """Associate the network with the actual master Deco device."""
-        super().__init__(coordinator)
-        self._deco_coordinator = deco_coordinator
+        """Initialize a Deco WiFi binary sensor."""
+        self.coordinator = coordinator
         self._master_deco = master_deco
-        self.entity_description = description
-        self._attr_unique_id = f"{master_deco.mac}_wifi_{description.key}"
-
-    async def async_added_to_hass(self) -> None:
-        """Listen for master changes independently of wireless updates."""
-        await super().async_added_to_hass()
-        self.async_on_remove(
-            self._deco_coordinator.async_add_listener(self._handle_deco_update)
+        self._form = network["form"]
+        self._paths = network["paths"]
+        self._attr_name = network["name"]
+        self._attr_icon = network["icon"]
+        self._attr_unique_id = (
+            f"{master_deco.mac}_wifi_{network['key']}"
         )
-
-    @callback
-    def _handle_deco_update(self) -> None:
-        """Re-evaluate availability when the master Deco changes."""
-        self.async_write_ha_state()
+        self._attr_is_on = None
 
     @property
-    def available(self) -> bool:
-        """Require both the original master and a supported current network."""
-        deco_data = self._deco_coordinator.data
-        active_master = getattr(deco_data, "master_deco", None)
-        return (
-            active_master is not None
-            and active_master.mac == self._master_deco.mac
-            and super().available
-            and isinstance(self.coordinator.data, dict)
-            and self.entity_description.key in self.coordinator.data
-        )
-
-    @property
-    def is_on(self) -> bool | None:
-        """Return the latest recognized enable flag."""
-        data = self.coordinator.data
-        return data.get(self.entity_description.key) if isinstance(data, dict) else None
-
-    @property
-    def extra_state_attributes(self) -> dict[str, str] | None:
-        """Return opt-in WiFi names only when the current network is available."""
-        if self.coordinator.expose_ssids is not True or not self.available:
-            return None
-        names = self.coordinator.ssid_names_for_master(
-            self._master_deco.mac, self.entity_description.key
-        )
-        return wireless_ssid_attributes(names) if names else None
-
-    @property
-    def device_info(self) -> DeviceInfo | None:
-        """Re-use the master Deco's stable device-registry identity."""
+    def device_info(self) -> DeviceInfo:
+        """Attach the sensor to the master Deco."""
         return create_device_info(
-            self._master_deco, self._master_deco, self._deco_coordinator
+            self._master_deco,
+            self._master_deco,
         )
+
+    async def async_update(self) -> None:
+        """Refresh the on/off state from the Deco."""
+        # Respect the polling switch so we don't hit the router while paused.
+        if self.coordinator.paused:
+            return
+        try:
+            config = await self.coordinator.api.async_get_wireless(self._form)
+            self._attr_is_on = wireless_is_enabled(config, self._paths)
+            self._attr_available = self._attr_is_on is not None
+        except Exception as err:  # noqa: BLE001 - keep last state, mark unavailable
+            _LOGGER.debug("Error updating %s WiFi status: %s", self._form, err)
+            self._attr_available = False

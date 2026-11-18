@@ -1,131 +1,28 @@
 """TP-Link Deco Coordinator"""
 
 import asyncio
-from collections.abc import Callable
-from dataclasses import dataclass
-from dataclasses import field
-from datetime import datetime
-from datetime import timedelta
-from datetime import timezone
 import ipaddress
 import logging
-from math import ceil
-from math import isfinite
-from time import monotonic
+from collections.abc import Callable
+from datetime import datetime, timedelta
 from typing import Any
 
-import aiohttp
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import CALLBACK_TYPE
-from homeassistant.core import HomeAssistant
-from homeassistant.core import callback
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed
-from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
 from .api import TplinkDecoApi
-from .api import normalize_name
-from .const import DEFAULT_SCAN_INTERVAL
-from .const import DOMAIN
-from .const import SIGNAL_CLIENT_ADDED
-from .const import SIGNAL_DECO_ADDED
-from .exceptions import LoginForbiddenException
-from .exceptions import LoginInvalidException
-from .exceptions import TimeoutException
-from .exceptions import TransientConnectionException
+from .const import DOMAIN, SIGNAL_CLIENT_ADDED, SIGNAL_DECO_ADDED
+from .exceptions import LoginForbiddenException, LoginInvalidException
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
-CLIENT_BACKOFF_INITIAL_SECONDS = 30
-CLIENT_BACKOFF_MAX_SECONDS = 300
-MAX_CONCURRENT_CLIENT_REQUESTS = 2
 
 
-@dataclass
-class CoordinatorHealth:
-    """Non-sensitive, per-entry metrics for real coordinator API polls."""
-
-    last_successful_update: datetime | None = None
-    response_time_ms: int | None = None
-    timeout_count: int = 0
-    consecutive_failures: int = 0
-    last_error: str = "0"
-    _listeners: list[CALLBACK_TYPE] = field(
-        default_factory=list, repr=False, compare=False
-    )
-
-    @callback
-    def async_add_listener(self, listener: CALLBACK_TYPE) -> CALLBACK_TYPE:
-        """Subscribe to health changes independently of coordinator updates."""
-        self._listeners.append(listener)
-
-        @callback
-        def _unsubscribe() -> None:
-            """Remove this listener safely when its entity is unloaded."""
-            if listener in self._listeners:
-                self._listeners.remove(listener)
-
-        return _unsubscribe
-
-    @callback
-    def _notify_listeners(self) -> None:
-        """Publish each measured change without breaking the ongoing API poll."""
-        for listener in tuple(self._listeners):
-            try:
-                listener()
-            except Exception as error:
-                _LOGGER.warning(
-                    "Deco health listener update failed (%s)",
-                    type(error).__name__,
-                )
-
-    def record_success(self, started: float, *, timed_out: bool = False) -> None:
-        """Record successful data, optionally with a timed-out peer node."""
-        self.last_successful_update = datetime.now(timezone.utc)
-        self.response_time_ms = max(0, round((monotonic() - started) * 1000))
-        self.consecutive_failures = 0
-        if timed_out:
-            self.timeout_count += 1
-            self.last_error = "TimeoutException"
-        self._notify_listeners()
-
-    def record_failure(self, started: float, error: Exception) -> None:
-        """Track failed polls by exception type, never by exception message."""
-        self.response_time_ms = max(0, round((monotonic() - started) * 1000))
-        self.consecutive_failures += 1
-        self.last_error = type(error).__name__
-        if isinstance(error, (TimeoutError, TimeoutException)):
-            self.timeout_count += 1
-        self._notify_listeners()
-
-    def record_incomplete(self, started: float, *, timed_out: bool = False) -> None:
-        """Record an all-failed poll and whether any node timed out."""
-        self.response_time_ms = max(0, round((monotonic() - started) * 1000))
-        self.consecutive_failures += 1
-        if timed_out:
-            self.timeout_count += 1
-        self.last_error = "TimeoutException" if timed_out else "NoSuccessfulClientList"
-        self._notify_listeners()
-
-
-def _coerce_finite_float(value: object) -> float | None:
-    """Parse legacy firmware numeric strings without accepting invalid values."""
-    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
-        return None
-
-    try:
-        number = float(value)
-    except (OverflowError, TypeError, ValueError):
-        return None
-
-    return number if isfinite(number) else None
-
-
-def bytes_to_bits(bytes_count: object) -> float | None:
-    """Preserve the existing byte-rate conversion for finite JSON numbers."""
-    numeric_value = _coerce_finite_float(bytes_count)
-    return numeric_value / 8 if numeric_value is not None else None
+def bits_to_kilobytes(bits_count):
+    return bits_count / 8 if bits_count is not None else bits_count
 
 
 def filter_invalid_ip(ip_address):
@@ -137,15 +34,13 @@ def filter_invalid_ip(ip_address):
         return None
 
 
-def snake_case_to_title_space(name: str) -> str:
-    """Convert firmware identifiers to display names."""
-    return " ".join(word.title() for word in name.split("_"))
+def snake_case_to_title_space(str):
+    return " ".join([w.title() for w in str.split("_")])
 
 
-async def async_call_and_propagate_config_error(func, *args, **kwargs):
-    """Forward API arguments and keep the established auth-failure mapping."""
+async def async_call_and_propagate_config_error(func, *args):
     try:
-        return await func(*args, **kwargs)
+        return await func(*args)
     except (LoginForbiddenException, LoginInvalidException) as err:
         raise ConfigEntryAuthFailed from err
 
@@ -159,18 +54,31 @@ class TpLinkDeco:
         self.hw_version = None
         self.sw_version = None
         self.device_model = None
+        self.device_type = None
 
         self.name = None
+        self.nickname = None
         self.ip_address = None
+        self.client_mesh = None
         self.online = None
+        self.inet = None
+        self.group_status = None
         self.internet_online = None
+        self.role = None
         self.master = None
+        self.slave = None
+        self.standalone = None
+        self.topology_auto = None
+        self.topology_device_id = None
         self.connection_type = None
         self.interface = None
+        self.previous = None
         self.bssid_band2_4 = None
         self.bssid_band5 = None
-        self.backhaul_bssid_band2_4 = None
-        self.backhaul_bssid_band5 = None
+        self.bssid_sta_2g = None
+        self.bssid_sta_5g = None
+        self.set_gateway_support = None
+        self.speed_get_support = None
         self.signal_band2_4 = None
         self.signal_band5 = None
         self.backhaul_speed = None
@@ -179,48 +87,53 @@ class TpLinkDeco:
         self.cpu_usage_raw = None
         self.mem_usage = None
         self.mem_usage_raw = None
+        self.inet_error_msg = None
 
     def update(
         self,
         data: dict[str, Any],
     ) -> None:
-        """Update Deco fields after validating optional signal data."""
-        signal_level = data.get("signal_level")
-        if signal_level is None:
-            signal_level = {}
-        elif not isinstance(signal_level, dict):
-            # Validate before mutating any cached node fields.
-            raise ValueError("Deco inventory contains invalid signal data")
-
         self.hw_version = data.get("hardware_ver")
         self.sw_version = data.get("software_ver")
         self.device_model = data.get("device_model")
-
-        custom_nickname = data.get("custom_nickname")
-        nickname = data.get("nickname")
-        name = normalize_name(custom_nickname) if custom_nickname else None
-        if not name and nickname:
-            name = normalize_name(snake_case_to_title_space(nickname))
-        self.name = name or self.mac
+        self.device_type = data.get("device_type")
+        self.name = data.get("custom_nickname")  # Only set if custom value
+        self.nickname = data.get("nickname")  # Always set, even if same as name
+        if self.name is None:
+            self.name = snake_case_to_title_space(self.nickname)
         self.ip_address = filter_invalid_ip(data.get("device_ip"))
+        self.client_mesh = data.get("client_mesh")
+        self.previous = data.get("previous")  # MAC van upstream node
         self.online = data.get("group_status") == "connected"
-        inet = data.get("inet_status")
-        if inet is None:
+        self.group_status = data.get("group_status")
+        self.inet_status = data.get("inet_status")
+        self.internet_online = None
+        if self.inet_status is None:
             self.internet_online = None
-        elif isinstance(inet, str):
-            self.internet_online = inet.lower() in ("online", "connected", "up")
+        elif isinstance(self.inet_status, str):
+            self.internet_online = self.inet_status.lower() in ("online", "connected", "up")
         else:
-            self.internet_online = bool(inet)
+            self.internet_online = bool(self.inet_status)
+        self.role = data.get("role")
         self.master = data.get("role") == "master"
+        self.slave = data.get("role") == "slave"
+        topology = data.get("topology", {})
+        self.topology_auto = topology.get("auto")
+        self.topology_device_id = topology.get("device_id")
         self.connection_type = data.get("connection_type")
+        self.interface = data.get("interface")
         self.bssid_band2_4 = data.get("bssid_2g")
         self.bssid_band5 = data.get("bssid_5g")
-        self.backhaul_bssid_band2_4 = data.get("bssid_sta_2g")
-        self.backhaul_bssid_band5 = data.get("bssid_sta_5g")
-        self.signal_band2_4 = signal_level.get("band2_4")
-        self.signal_band5 = signal_level.get("band5")
-        self.backhaul_speed = data.get("backhual_speed")
-        self.backhaul_max_speed = data.get("backhual_max_speed")
+        self.bssid_sta_2g = data.get("bssid_sta_2g")
+        self.bssid_sta_5g = data.get("bssid_sta_5g")
+        self.set_gateway_support = data.get("set_gateway_support")
+        self.speed_get_support = data.get("speed_get_support")
+        signal_level = data.get("signal_level")
+        self.signal_band2_4 = int(signal_level.get("band2_4") or 0) if signal_level else 0
+        self.signal_band5 = int(signal_level.get("band5") or 0) if signal_level else 0
+        self.backhaul_speed = data.get("backhaul_speed") or data.get("backhual_speed")
+        self.backhaul_max_speed = data.get("backhaul_max_speed") or data.get("backhual_max_speed")
+        self.inet_error_msg = data.get("inet_error_msg")
 
 
 class TpLinkDecoClient:
@@ -240,7 +153,7 @@ class TpLinkDecoClient:
 
     def update(
         self,
-        data: dict[str:Any],
+        data: dict[str, Any],
         deco_mac: str,
         utc_point_in_time: datetime,
     ) -> None:
@@ -250,9 +163,8 @@ class TpLinkDecoClient:
         self.online = data.get("online")
         self.connection_type = data.get("connection_type")
         self.interface = data.get("interface")
-        # Unknown rates contribute zero, not None, to live throughput totals.
-        self.down_kilobytes_per_s = bytes_to_bits(data.get("down_speed", 0)) or 0.0
-        self.up_kilobytes_per_s = bytes_to_bits(data.get("up_speed", 0)) or 0.0
+        self.down_kilobytes_per_s = bits_to_kilobytes(data.get("down_speed", 0))
+        self.up_kilobytes_per_s = bits_to_kilobytes(data.get("up_speed", 0))
         self.last_activity = utc_point_in_time
 
 
@@ -261,39 +173,34 @@ class TpLinkDecoData:
 
     def __init__(
         self,
-        master_deco: TpLinkDeco = None,
-        decos: dict[str:TpLinkDeco] = None,
+        master_deco: TpLinkDeco | None = None,
+        decos: dict[str, TpLinkDeco] | None = None,
     ) -> None:
         self.master_deco = master_deco
         self.decos = {} if decos is None else decos
 
+    @property
+    def standalone(self) -> bool:
+        """True if this entry has only one Deco node (no satellites)."""
+        return len(self.decos) == 1
 
-class TplinkDecoUpdateCoordinator(DataUpdateCoordinator):
+
+class TplinkDecoUpdateCoordinator(DataUpdateCoordinator[TpLinkDecoData]):
     """Class to manage fetching data from the API."""
+
+    data: TpLinkDecoData
 
     def __init__(
         self,
         hass: HomeAssistant,
         api: TplinkDecoApi,
         config_entry: ConfigEntry,
-        update_interval: timedelta = None,
-        data: TpLinkDecoData = None,
-        device_list_interval_seconds: int | None = None,
+        update_interval: timedelta | None = None,
+        data: TpLinkDecoData | None = None,
     ) -> None:
         """Initialize."""
         self.api = api
         self._on_close: list[Callable] = []
-        self.device_list_interval_seconds = (
-            device_list_interval_seconds
-            if device_list_interval_seconds is not None
-            else (
-                int(update_interval.total_seconds())
-                if update_interval is not None
-                else DEFAULT_SCAN_INTERVAL
-            )
-        )
-        self._last_device_list_update: float | None = None
-        self._force_device_list_refresh = False
 
         super().__init__(
             hass,
@@ -304,65 +211,57 @@ class TplinkDecoUpdateCoordinator(DataUpdateCoordinator):
         )
         # Must happen after super().__init__
         self.data = TpLinkDecoData() if data is None else data
-
+        _LOGGER.debug("Initialized TpLinkDecoUpdateCoordinator with data: %s", self.data)
         self.paused = False
-        self.health = CoordinatorHealth()
 
-    async def _async_update_data(self):
-        """Measure an actual Deco poll without changing pause semantics."""
-        if self.paused and not self._force_device_list_refresh:
+    async def _async_update_data(self) -> TpLinkDecoData:
+        """Update data via api."""
+        if self.paused:
             _LOGGER.debug("Deco polling is paused")
             return self.data
 
-        started = monotonic()
-        try:
-            data = await self._async_update_data_internal()
-        except Exception as error:
-            self.health.record_failure(started, error)
-            raise
+        new_decos = await async_call_and_propagate_config_error(
+            self.api.async_list_devices
+        )
 
-        self.health.record_success(started)
-        return data
+        performance_data = await async_call_and_propagate_config_error(
+            self.api.async_get_performance
+        )
 
-    async def _async_update_data_internal(self):
-        """Fetch and reconcile the Deco inventory and optional performance."""
-        # Commit a validated inventory before optional performance. A slow or
-        # failing performance API must not discard a successful device list.
-        if self._device_list_refresh_due():
-            new_decos = await async_call_and_propagate_config_error(
-                self.api.async_list_devices
-            )
-            self._process_device_list(new_decos)
-            self._last_device_list_update = monotonic()
-            self._force_device_list_refresh = False
+        old_decos = self.data.decos
+        master_deco = None
+        deco_added = False
+        decos = {}
+        for new_deco in new_decos:
+            mac = new_deco["mac"]
+            deco = old_decos.get(mac)
+            if deco is None:
+                deco_added = True
+                deco = TpLinkDeco(mac)
+                _LOGGER.debug("_async_update_data: Found new deco mac=%s", deco.mac)
+            deco.update(new_deco)
+            decos[mac] = deco
+            if deco.master:
+                master_deco = deco
 
-        try:
-            performance_data = await async_call_and_propagate_config_error(
-                self.api.async_get_performance
-            )
-        except (TransientConnectionException, TimeoutException, TimeoutError) as err:
-            # Performance is optional. Authentication and unexpected failures
-            # must still propagate. Never log upstream exception messages.
-            _LOGGER.debug(
-                "Optional Deco performance request failed (%s)",
-                type(err).__name__,
-            )
-            performance_data = None
+        for mac, old_deco in old_decos.items():
+            if mac not in decos:
+                _LOGGER.debug(
+                    "_async_update_data: Deco mac=%s not returned by API, marking offline",
+                    mac,
+                )
+                old_deco.online = False
+                old_deco.internet_online = False
+                decos[mac] = old_deco
 
-        master_deco = self.data.master_deco
         # Zet globale performance data op de master Deco
-        if not isinstance(performance_data, dict):
-            performance_data = None
-        result = performance_data.get("result", {}) if performance_data else {}
-        if not isinstance(result, dict):
-            result = {}
+        result = performance_data.get("result", {})
         if master_deco is not None:
             cpu_raw = result.get("cpu_usage")
             mem_raw = result.get("mem_usage")
 
-            cpu_value = _coerce_finite_float(cpu_raw)
-            if cpu_value is not None:
-                cpu_percent = cpu_value * 100
+            if cpu_raw is not None:
+                cpu_percent = cpu_raw * 100
                 master_deco.cpu_usage_raw = round(cpu_percent, 1)
 
                 if master_deco.cpu_usage is not None:
@@ -372,9 +271,8 @@ class TplinkDecoUpdateCoordinator(DataUpdateCoordinator):
                 else:
                     master_deco.cpu_usage = round(cpu_percent, 1)
 
-            mem_value = _coerce_finite_float(mem_raw)
-            if mem_value is not None:
-                mem_percent = mem_value * 100
+            if mem_raw is not None:
+                mem_percent = mem_raw * 100
                 master_deco.mem_usage_raw = round(mem_percent, 1)
 
                 if master_deco.mem_usage is not None:
@@ -384,99 +282,15 @@ class TplinkDecoUpdateCoordinator(DataUpdateCoordinator):
                 else:
                     master_deco.mem_usage = round(mem_percent, 1)
 
-        return self.data
-
-    def _device_list_refresh_due(self) -> bool:
-        """Check whether to refresh the mesh inventory this cycle."""
-        if self._force_device_list_refresh or self._last_device_list_update is None:
-            return True
-        if self.device_list_interval_seconds == 0:
-            return False
-        return (
-            monotonic() - self._last_device_list_update
-            >= self.device_list_interval_seconds
-        )
-
-    def _process_device_list(self, new_decos: list[dict[str, Any]]) -> None:
-        """Validate the complete inventory before modifying cached nodes."""
-        if not isinstance(new_decos, list):
-            raise ValueError("Deco inventory response must contain a device list")
-
-        macs: list[str] = []
-        for item in new_decos:
-            if not isinstance(item, dict):
-                raise ValueError("Deco inventory contains an invalid device")
-            mac = item.get("mac")
-            if not isinstance(mac, str) or not mac.strip():
-                raise ValueError("Deco inventory contains an invalid device ID")
-            signal_level = item.get("signal_level")
-            if signal_level is not None and not isinstance(signal_level, dict):
-                raise ValueError("Deco inventory contains invalid signal data")
-            for name_key in ("nickname", "custom_nickname"):
-                name_value = item.get(name_key)
-                if name_value is not None and not isinstance(name_value, str):
-                    raise ValueError("Deco inventory contains invalid name data")
-            macs.append(mac)
-
-        if len(macs) != len(set(macs)):
-            raise ValueError("Deco inventory contains duplicate device IDs")
-
-        old_decos = self.data.decos
-        master_deco = None
-        deco_added = False
-        decos: dict[str, TpLinkDeco] = {}
-        for new_deco in new_decos:
-            mac = new_deco["mac"]
-            deco = old_decos.get(mac)
-            if deco is None:
-                deco_added = True
-                deco = TpLinkDeco(mac)
-                _LOGGER.debug("New Deco node discovered during inventory refresh")
-            deco.update(new_deco)
-            decos[mac] = deco
-            if deco.master:
-                master_deco = deco
-
-        for mac, old_deco in old_decos.items():
-            if mac not in decos:
-                _LOGGER.debug(
-                    "Deco node not present in current inventory; marking offline"
-                )
-                old_deco.online = False
-                old_deco.internet_online = False
-                decos[mac] = old_deco
-
-        # Discovery handlers inspect coordinator.data synchronously.
-        self.data = TpLinkDecoData(master_deco, decos)
         if deco_added:
             async_dispatcher_send(self.hass, SIGNAL_DECO_ADDED)
 
-    async def async_request_device_refresh(self) -> None:
-        """Request a real device-list poll, even in startup-only mode."""
-        self._force_device_list_refresh = True
-        try:
-            await self.async_refresh()
-        except ConfigEntryAuthFailed:
-            # Keep the HA auth failure type without exposing an API message.
-            raise ConfigEntryAuthFailed(
-                "Deco authentication failed; check integration credentials"
-            ) from None
-        except Exception:
-            # A refresh can also propagate a raw upstream exception.
-            # Do not expose its message, which may contain session tokens.
-            raise HomeAssistantError(
-                "Unable to refresh Deco status; check the router connection"
-            ) from None
-        finally:
-            # A failed manual press must not silently unpause later polling.
-            # A second press may force another request.
-            self._force_device_list_refresh = False
-        if not self.last_update_success:
-            # DataUpdateCoordinator.async_refresh can absorb poll exceptions.
-            # Raise a safe error so the manual button reports failure to HA.
-            raise HomeAssistantError(
-                "Unable to refresh Deco status; check the router connection"
-            )
+        # Set standalone on each deco
+        is_standalone = len(decos) == 1
+        for deco in decos.values():
+            deco.standalone = is_standalone and deco.master
+
+        return TpLinkDecoData(master_deco, decos)
 
     @callback
     def on_close(self, func: CALLBACK_TYPE) -> None:
@@ -501,10 +315,10 @@ class TplinkDecoClientUpdateCoordinator(DataUpdateCoordinator):
         hass: HomeAssistant,
         api: TplinkDecoApi,
         config_entry: ConfigEntry,
-        deco_update_coordinator: TplinkDecoUpdateCoordinator,
+        deco_update_coordinator: TplinkDecoUpdateCoordinator | None,
         consider_home_seconds: int,
-        update_interval: timedelta = None,
-        data: dict[str:TpLinkDecoClient] = None,
+        update_interval: timedelta | None = None,
+        data: dict[str, TpLinkDecoClient] | None = None,
     ) -> None:
         """Initialize."""
         self.api = api
@@ -521,278 +335,53 @@ class TplinkDecoClientUpdateCoordinator(DataUpdateCoordinator):
         )
         # Must happen after super().__init__
         self.data = {} if data is None else data
-        self._client_backoff_until = 0.0
-        self._client_backoff_seconds = 0
-        self.has_successful_refresh = False
-        self.successfully_polled_deco_macs: set[str] = set()
-        self.health = CoordinatorHealth()
-        self._poll_had_valid_response = False
-        self._poll_had_timeout = False
-        self._client_query_mode = "per_node"
 
-    @property
-    def client_query_mode(self) -> str:
-        """Return the active per-node or global client query strategy."""
-        return self._client_query_mode
-
-    @property
-    def remaining_backoff_seconds(self) -> int:
-        """Return the remaining 5xx client-polling delay, rounded up."""
-        return max(0, ceil(self._client_backoff_until - monotonic()))
-
-    def _apply_client_backoff(self) -> None:
-        """Double the delay after an HTTP 5xx polling cycle, up to five minutes."""
-        self._client_backoff_seconds = min(
-            self._client_backoff_seconds * 2 or CLIENT_BACKOFF_INITIAL_SECONDS,
-            CLIENT_BACKOFF_MAX_SECONDS,
-        )
-        self._client_backoff_until = monotonic() + self._client_backoff_seconds
-        _LOGGER.warning(
-            "Deco client polling hit HTTP 5xx; pausing for %d seconds",
-            self._client_backoff_seconds,
-        )
-
-    def _reset_client_backoff(self) -> None:
-        """Reset the delay once every queried Deco returned a valid response."""
-        if self._client_backoff_seconds:
-            _LOGGER.info("Deco client polling recovered after HTTP 5xx backoff")
-        self._client_backoff_seconds = 0
-        self._client_backoff_until = 0.0
-
-    async def _async_clients_for_deco(
-        self, deco_mac: str
-    ) -> tuple[list[dict[str, Any]] | None, bool]:
-        """Return clients and whether an HTTP 5xx response occurred."""
-        try:
-            clients = await async_call_and_propagate_config_error(
-                self.api.async_list_clients,
-                deco_mac,
-                timeout_error_retries=0,
-            )
-        except TimeoutException:
-            # One failed Deco must not trigger repeated per-node timeouts.
-            self._poll_had_timeout = True
-            _LOGGER.debug("Deco client poll timed out")
-            return None, False
-        except TransientConnectionException:
-            # A failed request is not equivalent to a valid empty client list.
-            _LOGGER.debug("Deco client poll incomplete after transport retries")
-            return None, False
-        except aiohttp.ClientResponseError as err:
-            if not 500 <= err.status < 600:
-                raise
-            _LOGGER.debug("Deco client poll returned HTTP %d", err.status)
-            return None, True
-        return clients, False
-
-    async def _async_list_clients_globally(self) -> list[dict[str, Any]] | None:
-        """Try one global query without masking authentication or invalid data."""
-        try:
-            response = await async_call_and_propagate_config_error(
-                self.api.async_list_clients,
-                "default",
-                timeout_error_retries=0,
-            )
-        except TimeoutException:
-            self._poll_had_timeout = True
-            _LOGGER.debug("Global Deco client poll timed out")
-            return None
-        except TransientConnectionException:
-            _LOGGER.debug("Global Deco client poll incomplete")
-            return None
-        except aiohttp.ClientResponseError as err:
-            if not 500 <= err.status < 600:
-                raise
-            _LOGGER.debug("Global Deco client poll returned HTTP %d", err.status)
-            return None
-        if not isinstance(response, list) or any(
-            not isinstance(item, dict) for item in response
-        ):
-            raise ValueError("Invalid global Deco client list response")
-
-        # Preflight every client before updating cached models or claiming
-        # a valid global poll. A bad later entry must not partially commit.
-        seen_macs: set[str] = set()
-        preview_time = dt_util.utcnow()
-        for item in response:
-            mac = item.get("mac")
-            if not isinstance(mac, str) or not mac.strip() or mac in seen_macs:
-                raise ValueError("Invalid global Deco client list response")
-            seen_macs.add(mac)
-            try:
-                TpLinkDecoClient(mac).update(item, "", preview_time)
-            except Exception:
-                # Do not leak firmware fields via the exception chain.
-                raise ValueError("Invalid global Deco client list response") from None
-        return response
-
-    async def _async_list_clients_per_deco(
-        self, deco_macs: list[str]
-    ) -> list[tuple[list[dict[str, Any]] | None, bool]]:
-        """Poll at most two Decos concurrently and cancel pending work on error."""
-        semaphore = asyncio.Semaphore(MAX_CONCURRENT_CLIENT_REQUESTS)
-
-        async def _poll_one(deco_mac: str) -> tuple[list[dict[str, Any]] | None, bool]:
-            """Bound the request without blocking the Home Assistant event loop."""
-            async with semaphore:
-                return await self._async_clients_for_deco(deco_mac)
-
-        tasks = [asyncio.create_task(_poll_one(mac)) for mac in deco_macs]
-        try:
-            return await asyncio.gather(*tasks)
-        except (Exception, asyncio.CancelledError):
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            raise
-
-    @staticmethod
-    def _validate_client_responses(
-        responses: list[tuple[list[dict[str, Any]] | None, bool]],
-    ) -> None:
-        """Reject malformed node replies before changing cached client state."""
-        preview_time = dt_util.utcnow()
-        for response, _ in responses:
-            if response is None:
-                continue
-            if not isinstance(response, list):
-                raise ValueError("Invalid Deco client list response")
-
-            seen_macs: set[str] = set()
-            for item in response:
-                if not isinstance(item, dict):
-                    raise ValueError("Invalid Deco client list response")
-                mac = item.get("mac")
-                if not isinstance(mac, str) or not mac.strip() or mac in seen_macs:
-                    raise ValueError("Invalid Deco client list response")
-                seen_macs.add(mac)
-                name = item.get("name")
-                if name is not None and not isinstance(name, str):
-                    raise ValueError("Invalid Deco client list response")
-                try:
-                    TpLinkDecoClient(mac).update(item, "", preview_time)
-                except Exception:
-                    raise ValueError("Invalid Deco client list response") from None
-
-    async def _async_update_data(self):
-        """Measure actual client queries, excluding pause and backoff skips."""
+    async def _async_update_data(self) -> dict[str, TpLinkDecoClient] | None:
+        """Update data via api."""
         if self._deco_update_coordinator.paused:
             _LOGGER.debug("Deco client polling is paused")
             return self.data
 
-        if not self._deco_update_coordinator.data.decos:
-            return self.data
+        if len(self._deco_update_coordinator.data.decos) == 0:
+            return self.data  # No decos, so no clients
 
-        if self.remaining_backoff_seconds and self._client_query_mode != "global":
-            _LOGGER.debug(
-                "Skipping per-node Deco polling during HTTP 5xx backoff (%ds remaining)",
-                self.remaining_backoff_seconds,
-            )
-            return self.data
-
-        started = monotonic()
-        self._poll_had_valid_response = False
-        self._poll_had_timeout = False
-        try:
-            data = await self._async_update_data_internal()
-        except Exception as error:
-            self.health.record_failure(started, error)
-            raise
-
-        if self._poll_had_valid_response:
-            self.health.record_success(started, timed_out=self._poll_had_timeout)
-        else:
-            self.health.record_incomplete(started, timed_out=self._poll_had_timeout)
-        return data
-
-    async def _async_update_data_internal(self):
-        """Fetch per-node or global clients while retaining last-known state."""
         old_clients = self.data
         clients = {}
         client_added = False
-        deco_macs = list(self._deco_update_coordinator.data.decos)
+        # List clients for all decos if _deco_update_coordinator is not provided
+        deco_macs = self._deco_update_coordinator.data.decos.keys()
         utc_point_in_time = dt_util.utcnow()
+        # Send list client requests in parallel for each deco
 
-        # While per-node 5xx backoff is active, use the known-good global
-        # strategy without reissuing broken per-node requests.
-        global_only = (
-            self._client_query_mode == "global" and self.remaining_backoff_seconds > 0
+        deco_client_responses = await asyncio.gather(
+            *[
+                async_call_and_propagate_config_error(
+                    self.api.async_list_clients, deco_mac
+                )
+                for deco_mac in deco_macs
+            ]
         )
-        deco_client_responses = (
-            [] if global_only else await self._async_list_clients_per_deco(deco_macs)
-        )
-        # Reject malformed peer data before applying any backoff or cached
-        # client mutations. The global fallback has its own full preflight.
-        self._validate_client_responses(deco_client_responses)
-        server_error = any(error for _, error in deco_client_responses)
-        if server_error:
-            self._apply_client_backoff()
 
-        if global_only or server_error:
-            master = self._deco_update_coordinator.data.master_deco
-            if master is not None:
-                global_clients = await self._async_list_clients_globally()
-                if global_clients is not None:
-                    # Global data lacks a reliable node identity. Use the
-                    # real master MAC, never the API sentinel "default".
-                    deco_macs = [master.mac]
-                    deco_client_responses = [(global_clients, False)]
-                    self._client_query_mode = "global"
-                elif global_only:
-                    return old_clients
-            elif global_only:
-                return old_clients
-
-        if (
-            not global_only
-            and not server_error
-            and all(response is not None for response, _ in deco_client_responses)
-        ):
-            self._reset_client_backoff()
-            self._client_query_mode = "per_node"
-
-        failed_deco_macs = {
-            deco_mac
-            for deco_mac, (response, _) in zip(deco_macs, deco_client_responses)
-            if response is None
-        }
-        if len(failed_deco_macs) == len(deco_macs):
-            # Unknown client-to-node assignments must also survive a poll
-            # where no Deco returned a valid client list.
-            return old_clients
-
-        # An empty but successful response still confirms this Deco's count.
-        # Do not create a misleading zero-count entity for an unpolled peer.
-        self.successfully_polled_deco_macs.update(
-            mac
-            for mac, (response, _) in zip(deco_macs, deco_client_responses)
-            if response is not None
-        )
-        self.has_successful_refresh = True
-        self._poll_had_valid_response = True
-
-        for deco_mac, (deco_clients, _) in zip(deco_macs, deco_client_responses):
-            if deco_clients is None:
-                continue
+        # if len(deco_client_responses) > 0:
+        # deco_macs is not subscriptable, must be iterated
+        for deco_mac, deco_clients in zip(deco_macs, deco_client_responses):
             for deco_client in deco_clients:
                 client_mac = deco_client["mac"]
                 client = old_clients.get(client_mac)
                 if client is None:
                     client_added = True
                     client = TpLinkDecoClient(client_mac)
-                    _LOGGER.debug("New Deco client discovered during polling")
+                    _LOGGER.debug(
+                        "_async_update_data: Found new client mac=%s", client.mac
+                    )
                 client.update(deco_client, deco_mac, utc_point_in_time)
                 clients[client_mac] = client
 
-        # Retain previous association, state and activity when its node was
-        # not polled successfully; apply the usual grace policy otherwise.
+        # Copy over clients no longer online
         for client in old_clients.values():
             mac = client.mac
             if mac not in clients:
                 clients[mac] = client
-                if client.deco_mac in failed_deco_macs:
-                    continue
                 if client.last_activity is None:
                     client.online = False
                 else:

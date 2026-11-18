@@ -1,39 +1,40 @@
 import asyncio
 import base64
+import binascii
 import hashlib
 import json
 import logging
 import math
 import re
 import secrets
+from collections.abc import Sequence
 from typing import Any
 from urllib.parse import quote_plus
-from urllib.parse import urlsplit
 
+import async_timeout
+from aiohttp import (
+    ClientConnectorError,
+    ClientError,
+    ClientResponseError,
+    ClientSession,
+    ServerDisconnectedError,
+)
+from aiohttp.hdrs import CONTENT_TYPE, SET_COOKIE
 from Crypto.Cipher import PKCS1_v1_5
 from Crypto.PublicKey import RSA
-import aiohttp
-from aiohttp.hdrs import CONTENT_TYPE
-from aiohttp.hdrs import SET_COOKIE
-import async_timeout
 from cryptography.hazmat.primitives import padding
-from cryptography.hazmat.primitives.ciphers import Cipher
-from cryptography.hazmat.primitives.ciphers import algorithms
-from cryptography.hazmat.primitives.ciphers import modes
-import homeassistant.util.ssl as ssl
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from homeassistant.util import ssl
 
-from .const import DEFAULT_TIMEOUT_ERROR_RETRIES
-from .const import DEFAULT_TIMEOUT_SECONDS
-from .exceptions import EmptyDataException
-from .exceptions import ForbiddenException
-from .exceptions import LoginForbiddenException
-from .exceptions import LoginInvalidException
-from .exceptions import TimeoutException
-from .exceptions import TransientConnectionException
-from .exceptions import UnexpectedApiException
-from .system_log import MAX_SYSTEM_LOG_BYTES
-from .system_log import SystemLogLevel
-from .system_log import decode_system_log
+from .const import DEFAULT_TIMEOUT_ERROR_RETRIES, DEFAULT_TIMEOUT_SECONDS
+from .exceptions import (
+    EmptyDataException,
+    ForbiddenException,
+    LoginForbiddenException,
+    LoginInvalidException,
+    TimeoutException,
+    UnexpectedApiException,
+)
 
 AES_KEY_BYTES = 16
 MIN_AES_KEY = 10 ** (AES_KEY_BYTES - 1)
@@ -43,56 +44,58 @@ PKCS1_v1_5_HEADER_BYTES = 11
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 LEGACY_ERROR_DECODING_PATTERN = re.compile(r"^<Error Decoding (.*)>$")
-SYSTEM_LOG_CONTEXT = "Get System Log"
 
 
-def normalize_name(name: str | None) -> str | None:
-    """Restore raw names from placeholders created by older integration versions."""
-    if not name:
+def normalize_name(name: str) -> str:
+    """Normalize Deco/client names from current and legacy decoding behavior."""
+    if not isinstance(name, str) or not name:
         return name
 
-    match = LEGACY_ERROR_DECODING_PATTERN.fullmatch(name)
-    return match.group(1) if match else name
+    match = LEGACY_ERROR_DECODING_PATTERN.match(name)
+    if match:
+        return match.group(1)
+
+    return name
 
 
 def byte_len(n: int) -> int:
     return (int(math.log2(n)) + 8) >> 3
 
 
-def decode_name_with_fallback(name: str | None) -> str | None:
-    """Decode base64 UTF-8 names, preserving unencoded names from legacy firmware."""
+def decode_name_with_fallback(name: str) -> str:
+    """Decode a Base64-encoded name and fall back to the raw name."""
     if not name:
         return name
 
     try:
-        return normalize_name(base64.b64decode(name, validate=True).decode("utf-8"))
-    except (UnicodeError, ValueError):
+        decoded = base64.b64decode(name, validate=True)
+        return normalize_name(decoded.decode("utf-8"))
+    except (binascii.Error, UnicodeDecodeError):
         return normalize_name(name)
 
 
-def rsa_encrypt(n: int, e: int, plaintext: bytes) -> bytes:
-    """
+def rsa_encrypt(n: int, e: int, plaintext: bytes) -> str:
+    """Encrypt plaintext with RSA PKCS#1 v1.5 in TP-Link-compatible blocks.
     RSA encrypts plaintext. TP-Link breaks the plaintext down into blocks and concatenates the output.
     :param n: The RSA public key's n value
     :param e: The RSA public key's e value
     :param plaintext: The data to encrypt
     :return: RSA encrypted ciphertext
     """
+
     public_key = RSA.construct((n, e)).publickey()
     encryptor = PKCS1_v1_5.new(public_key)
+
     block_size = byte_len(n)
     bytes_per_block = block_size - PKCS1_v1_5_HEADER_BYTES
 
-    encrypted_text = ""
-    text_bytes = len(plaintext)
-    index = 0
-    while index < text_bytes:
-        content_num_bytes = min(bytes_per_block, text_bytes - index)
-        content = plaintext[index : index + content_num_bytes]
-        encrypted_text += encryptor.encrypt(content).hex()
-        index += content_num_bytes
+    encrypted_blocks: list[str] = []
 
-    return encrypted_text
+    for index in range(0, len(plaintext), bytes_per_block):
+        content = plaintext[index: index + bytes_per_block]
+        encrypted_blocks.append(encryptor.encrypt(content).hex())
+
+    return "".join(encrypted_blocks)
 
 
 def aes_encrypt(key: bytes, iv: bytes, plaintext: bytes) -> bytes:
@@ -129,18 +132,118 @@ def check_data_error_code(context, data):
     error_code = data.get("error_code") or data.get("errorcode")
     if error_code:
         if error_code == "timeout":
-            raise TimeoutException('Deco API response error_code="timeout"')
+            raise TimeoutException(f'{context} response error_code="timeout"')
 
-        # Codes and firmware payloads can contain attacker-controlled strings.
-        _LOGGER.debug("Deco API returned an error code")
-        safe_code = error_code if type(error_code) is int else "unknown"
-        raise UnexpectedApiException(f"Deco API error_code={safe_code}")
+        _LOGGER.debug("%s error_code=%s, data=%s", context, error_code, data)
+        raise UnexpectedApiException(f"{context} error_code={error_code}")
+
+
+def _normalize_enable(value) -> bool:
+    """Interpret a Deco enable flag (bool or "on"/"off" string) as a bool."""
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("on", "true", "1", "enable", "enabled")
+
+
+def _match_key(pattern: str, key: str) -> bool:
+    """Match a config key against a path segment (trailing '*' is a wildcard)."""
+    if pattern.endswith("*"):
+        return str(key).startswith(pattern[:-1])
+    return pattern == key
+
+
+def _resolve_sections(
+    config: dict[str, object],
+    paths: Sequence[Sequence[str]],
+) -> list[dict[str, object]]:
+    """Return the section dictionaries reached by following the given paths.
+
+    A path contains key patterns, for example ``["band*", "host"]``
+    resolves ``band2_4.host`` and ``band5_1.host``.
+
+    The returned dictionaries are live references into ``config``. Mutating
+    them therefore also mutates the original configuration.
+
+    Args:
+        config: Configuration dictionary to search.
+        paths: Key-pattern paths used to resolve sections.
+
+    Returns:
+        A list containing all resolved section dictionaries.
+    """
+    sections: list[dict[str, object]] = []
+
+    for path in paths:
+        nodes: list[object] = [config]
+
+        for pattern in path:
+            next_nodes: list[object] = []
+
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
+
+                next_nodes.extend(
+                    value
+                    for key, value in node.items()
+                    if isinstance(key, str) and _match_key(pattern, key)
+                )
+
+            nodes = next_nodes
+
+        sections.extend(
+            node
+            for node in nodes
+            if isinstance(node, dict)
+        )
+
+    return sections
+
+
+def wireless_is_enabled(config, paths) -> bool | None:
+    """Return True if any targeted section of a wireless config is enabled.
+
+    Returns None if none of the paths resolve to a section with an "enable"
+    flag (i.e. the network is not present on this Deco model / firmware).
+    """
+    enables = [
+        _normalize_enable(section["enable"])
+        for section in _resolve_sections(config, paths)
+        if "enable" in section
+    ]
+    if not enables:
+        return None
+    return any(enables)
+
+
+# Keys whose values are secrets (SSID / passwords) and must not be logged.
+_WIRELESS_SECRET_KEY_HINTS = ("ssid", "key", "password", "passwd", "psk", "secret")
+
+
+def redact_wireless(config):
+    """Return a deep copy of a wireless config with secret values masked.
+
+    Keeps structure and enable flags so the shape can be shared safely.
+    """
+    if isinstance(config, dict):
+        redacted = {}
+        for key, value in config.items():
+            if isinstance(value, (dict, list)):
+                redacted[key] = redact_wireless(value)
+            elif any(hint in key.lower() for hint in _WIRELESS_SECRET_KEY_HINTS):
+                redacted[key] = "***"
+            else:
+                redacted[key] = value
+        return redacted
+    if isinstance(config, list):
+        return [redact_wireless(item) for item in config]
+    return config
 
 
 class TplinkDecoApi:
     def __init__(
         self,
-        session: aiohttp.ClientSession,
+        session: ClientSession,
         host: str,
         username: str,
         password: str,
@@ -166,10 +269,15 @@ class TplinkDecoApi:
         self._sign_rsa_n = None
         self._sign_rsa_e = None
 
-        self._login_future = None
+        self._login_task: asyncio.Task[None] | None = None
+        self._wireless_read_tasks: dict[str, asyncio.Task[dict]] = {}
         self._seq = None
         self._stok = None
         self._cookie = None
+
+        # Lock to serialize all requests to the Deco management API.
+        # The Deco firmware cannot handle concurrent admin requests reliably. ??
+        self._request_lock = asyncio.Lock()
 
         if verify_ssl:
             self._ssl_context = None
@@ -193,11 +301,12 @@ class TplinkDecoApi:
             data=self._encode_payload(device_list_payload),
         )
         data = self._decrypt_data(context, response_json["data"])
-        self._check_authenticated_data_error_code(context, data)
+        check_data_error_code(context, data)
 
         try:
             device_list = data["result"]["device_list"]
             _LOGGER.debug("List devices device_count=%d", len(device_list))
+            _LOGGER.debug("List devices device_list=%s", device_list)
 
             for device in device_list:
                 custom_nickname = device.get("custom_nickname")
@@ -208,16 +317,19 @@ class TplinkDecoApi:
 
             return device_list
         except Exception as err:
-            _LOGGER.error("Deco device-list parsing failed (%s)", type(err).__name__)
+            _LOGGER.error("%s parse response error=%s, data=%s", context, err, data)
             raise
 
     # Reboot decos.
-    async def async_reboot_decos(self, deco_macs: list[str]) -> None:
-        """Reboot Deco devices, retrying once if an authenticated session expires."""
-        await self._async_call_with_retry(self._async_reboot_decos, deco_macs)
+    async def async_reboot_decos(self, deco_macs: Sequence[str]) -> None:
+        """Reboot the specified Deco nodes."""
+        await self._async_call_with_retry(
+            self._async_reboot_decos_inner,
+            deco_macs,
+        )
 
-    async def _async_reboot_decos(self, deco_macs: list[str]) -> None:
-        """Submit a reboot request with the current authenticated session."""
+    async def _async_reboot_decos_inner(self, deco_macs: Sequence[str]) -> None:
+        """Reboot the specified Deco nodes."""
         await self.async_login_if_needed()
 
         context = f"Reboot Decos {deco_macs}"
@@ -225,6 +337,7 @@ class TplinkDecoApi:
             "operation": "reboot",
             "params": {"mac_list": [{"mac": mac} for mac in deco_macs]},
         }
+
         response_json = await self._async_post(
             context,
             f"{self._host}/cgi-bin/luci/;stok={self._stok}/admin/device",
@@ -233,258 +346,48 @@ class TplinkDecoApi:
         )
 
         data = self._decrypt_data(context, response_json["data"])
-        self._check_authenticated_data_error_code(context, data)
-        _LOGGER.debug("Deco reboot request accepted")
+        check_data_error_code(context, data)
 
-    async def async_get_wireless(self) -> dict[str, Any]:
-        """Read optional wireless status without additional timeout retries."""
-        return await self._async_call_with_retry(
-            self._async_get_wireless, timeout_error_retries=0
+        _LOGGER.debug("Rebooted decos %s", deco_macs)
+
+    # Read the wireless config for a given form (e.g. wlan).
+    # Returns the raw "result" dict as sent by the Deco. Concurrent reads of the
+    # same form (e.g. all WiFi status sensors polling at once) share one request.
+    async def async_get_wireless(self, form: str) -> dict:
+        """Read wireless configuration for a form, sharing concurrent requests."""
+        task = self._wireless_read_tasks.get(form)
+
+        if task is not None:
+            return await task
+
+        task = asyncio.create_task(
+            self._async_call_with_retry(self._async_get_wireless, form)
         )
+        self._wireless_read_tasks[form] = task
 
-    async def _async_get_wireless(self) -> dict[str, Any]:
-        """Return a validated WiFi mapping without logging its contents."""
+        try:
+            return await task
+        finally:
+            if self._wireless_read_tasks.get(form) is task:
+                self._wireless_read_tasks.pop(form, None)
+
+    async def _async_get_wireless(self, form: str) -> dict:
         await self.async_login_if_needed()
-        context = "Get wireless status"
+
+        context = f"Get Wireless {form}"
         response_json = await self._async_post(
             context,
             f"{self._host}/cgi-bin/luci/;stok={self._stok}/admin/wireless",
-            params={"form": "wlan"},
+            params={"form": form},
             data=self._encode_payload({"operation": "read"}),
         )
-        if not isinstance(response_json, dict):
-            raise UnexpectedApiException("Wireless status response is malformed")
-        encrypted_data = response_json.get("data")
-        if not isinstance(encrypted_data, str):
-            raise UnexpectedApiException("Wireless status encrypted data is missing")
 
-        payload = self._decrypt_data(context, encrypted_data)
-        if not isinstance(payload, dict):
-            raise UnexpectedApiException("Wireless status response is malformed")
-        error_code = payload.get("error_code") or payload.get("errorcode")
-        if error_code in (-5002, "-5002"):
-            self.clear_auth()
-            raise EmptyDataException("Wireless status authentication expired")
-        if error_code == "timeout":
-            raise TimeoutException("Wireless status request timed out")
-        if error_code not in (0, None, ""):
-            raise UnexpectedApiException("Wireless status request was rejected")
-        result = payload.get("result")
-        if not isinstance(result, dict):
-            raise UnexpectedApiException("Wireless status response is malformed")
+        data = self._decrypt_data(context, response_json["data"])
+        check_data_error_code(context, data)
+        result = data.get("result", {})
+        # Log the (redacted) structure without leaking SSID/passwords.
+        _LOGGER.debug("%s result=%s", context, redact_wireless(result))
         return result
-
-    async def async_get_mobile_data_usage(self) -> int | None:
-        """Read optional mobile WAN usage in KiB without extra timeout retries."""
-        return await self._async_call_with_retry(
-            self._async_get_mobile_data_usage, timeout_error_retries=0
-        )
-
-    async def _async_get_mobile_data_usage(self) -> int | None:
-        """Parse a supported firmware's read-only encrypted usage response."""
-        await self.async_login_if_needed()
-        context = "Get mobile data usage"
-        response = await self._async_post(
-            context,
-            f"{self._host}/cgi-bin/luci/;stok={self._stok}/admin/network",
-            params={"form": "internet"},
-            data=self._encode_payload({"operation": "read"}),
-        )
-        if not isinstance(response, dict) or not isinstance(response.get("data"), str):
-            raise UnexpectedApiException("Mobile data response is malformed")
-
-        payload = self._decrypt_data(context, response["data"])
-        if not isinstance(payload, dict):
-            raise UnexpectedApiException("Mobile data response is malformed")
-        error_code = payload.get("error_code") or payload.get("errorcode")
-        if error_code in (-5002, "-5002"):
-            self.clear_auth()
-            raise EmptyDataException("Mobile data authentication expired")
-        if error_code == "timeout":
-            raise TimeoutException("Mobile data request timed out")
-        if error_code not in (0, None, ""):
-            raise UnexpectedApiException("Mobile data request was rejected")
-
-        result = payload.get("result")
-        if not isinstance(result, dict):
-            raise UnexpectedApiException("Mobile data response is malformed")
-        mobile = result.get("mobile_cpe")
-        if not isinstance(mobile, dict):
-            return None
-        value = mobile.get("data_usage")
-        if isinstance(value, bool):
-            return None
-        if isinstance(value, int):
-            return value if 0 <= value <= 2**63 - 1 else None
-        if isinstance(value, str) and value.isascii() and value.isdecimal():
-            parsed = int(value) if len(value) <= 19 else None
-            return parsed if parsed is not None and parsed <= 2**63 - 1 else None
-        return None
-
-    async def async_get_system_log(
-        self, level: SystemLogLevel = SystemLogLevel.ALL
-    ) -> str:
-        """Return a bounded plain-text log snapshot after the usual auth retry."""
-        return await self._async_call_with_retry(
-            self._async_get_system_log,
-            level,
-            timeout_error_retries=0,
-            transient_error_retries=0,
-        )
-
-    async def _async_get_system_log(self, level: SystemLogLevel) -> str:
-        """Build the log snapshot through the encrypted LuCI endpoint."""
-        await self.async_login_if_needed()
-        if getattr(self, "_outer_id", None) is not None:
-            raise UnexpectedApiException(
-                "System log export is unsupported on legacy sessions"
-            )
-        response = await self._async_post(
-            SYSTEM_LOG_CONTEXT,
-            self._log_export_url(),
-            params={"form": "feedback_log"},
-            data=self._encode_payload(
-                {"operation": "build", "params": {"level": int(level)}}
-            ),
-        )
-        if not isinstance(response, dict) or not isinstance(response.get("data"), str):
-            raise UnexpectedApiException("System log build response is malformed")
-        payload = self._decrypt_data(SYSTEM_LOG_CONTEXT, response["data"])
-        if not isinstance(payload, dict):
-            raise UnexpectedApiException("System log build response is malformed")
-        error_code = payload.get("error_code") or payload.get("errorcode")
-        if error_code in (-5002, "-5002"):
-            self.clear_auth()
-            raise EmptyDataException("System log authentication expired")
-        if error_code == "timeout":
-            raise TimeoutException("System log build timed out")
-        if error_code not in (0, None, ""):
-            raise UnexpectedApiException("System log build was rejected")
-        return await self._async_save_system_log()
-
-    def _log_export_url(self) -> str:
-        """Return the authenticated URL without logging its LuCI token."""
-        return f"{self._host}/cgi-bin/luci/;stok={self._stok}/admin/log_export"
-
-    @staticmethod
-    def _parse_system_log_error(
-        body: bytes, content_type: str
-    ) -> dict[str, Any] | None:
-        """Recognize firmware error JSON without trusting its MIME type."""
-        declared_json = content_type == "application/json"
-        if not declared_json:
-            if content_type not in ("text/plain", "application/octet-stream"):
-                return None
-            if not body.lstrip().startswith(b"{") or (
-                b'"errorcode"' not in body and b'"error_code"' not in body
-            ):
-                return None
-        try:
-            if declared_json:
-                parsed = json.loads(body)
-            else:
-                # Only a single JSON object can be a firmware error envelope.
-                # A second JSON Lines record is ordinary log content, even
-                # when the first record contains a nested error-code field.
-                log_text = body.decode("utf-8").lstrip()
-                parsed, end_index = json.JSONDecoder().raw_decode(log_text)
-                if log_text[end_index:].strip():
-                    return None
-        except (UnicodeError, ValueError, TypeError, RecursionError):
-            raise UnexpectedApiException("System log response is malformed") from None
-        if not isinstance(parsed, dict):
-            if declared_json:
-                raise UnexpectedApiException("System log response is malformed")
-            return None
-        if declared_json or "errorcode" in parsed or "error_code" in parsed:
-            return parsed
-        return None
-
-    async def _async_save_system_log(self) -> str:
-        """Fetch the unencrypted Save Log response without logging its content."""
-        form = aiohttp.FormData()
-        form.add_field("operation", "save")
-        cookies = {}
-        if self._cookie and self._cookie.startswith("sysauth="):
-            cookies["sysauth"] = self._cookie.partition("=")[2]
-        try:
-            async with asyncio.timeout(self._timeout_seconds):
-                response = await self._session.post(
-                    self._log_export_url(),
-                    params={"form": "save_log"},
-                    data=form,
-                    cookies=cookies,
-                    ssl=self._ssl_context,
-                )
-                try:
-                    response.raise_for_status()
-                    self._update_https_host_after_redirect(response)
-                    # read(n) may yield fewer than n bytes even when more
-                    # data remains; keep reading until EOF under a hard cap.
-                    buffer = bytearray()
-                    while True:
-                        chunk = await response.content.read(
-                            min(65536, MAX_SYSTEM_LOG_BYTES + 1 - len(buffer))
-                        )
-                        if not chunk:
-                            break
-                        buffer.extend(chunk)
-                        if len(buffer) > MAX_SYSTEM_LOG_BYTES:
-                            raise UnexpectedApiException(
-                                "System log snapshot exceeds size limit"
-                            )
-                    body = bytes(buffer)
-                    # Firmware may mislabel auth-error JSON as plain text;
-                    # never write those responses into a sensitive log file.
-                    error = self._parse_system_log_error(body, response.content_type)
-                    if error is not None:
-                        error_code = error.get("errorcode") or error.get("error_code")
-                        if error_code in ("timeout", -5002, "-5002"):
-                            self.clear_auth()
-                            raise EmptyDataException(
-                                "System log authentication expired"
-                            )
-                        raise UnexpectedApiException("System log download was rejected")
-                    if response.content_type not in (
-                        "text/plain",
-                        "application/gzip",
-                        "application/x-gzip",
-                        "application/x-tar",
-                        "application/octet-stream",
-                    ):
-                        raise UnexpectedApiException(
-                            "System log snapshot content type is unsupported"
-                        )
-                    if response.content_type != "text/plain" and not (
-                        body.startswith(b"\x1f\x8b") or body[257:262] == b"ustar"
-                    ):
-                        raise UnexpectedApiException(
-                            "System log snapshot content type is unsupported"
-                        )
-                    # Tar scans and gzip inflation are CPU-bound and must not
-                    # block Home Assistant's running event loop.
-                    return await asyncio.to_thread(decode_system_log, body)
-                finally:
-                    response.release()
-        except asyncio.TimeoutError:
-            raise TimeoutException("System log request timed out") from None
-        except aiohttp.ClientResponseError as error:
-            if error.status in (401, 403):
-                self.clear_auth()
-                raise ForbiddenException("System log authentication expired") from None
-            raise UnexpectedApiException("System log HTTP request failed") from None
-        except (
-            aiohttp.ClientPayloadError,
-            aiohttp.ServerDisconnectedError,
-            asyncio.IncompleteReadError,
-            ConnectionResetError,
-            BrokenPipeError,
-        ):
-            raise TransientConnectionException(
-                "System log response incomplete"
-            ) from None
-        except (aiohttp.ClientError, OSError):
-            raise UnexpectedApiException("System log transport failed") from None
 
     # Return performance data (CPU / memory)
     async def async_get_performance(self) -> dict:
@@ -504,26 +407,12 @@ class TplinkDecoApi:
         )
 
         data = self._decrypt_data(context, response_json["data"])
-        self._check_authenticated_data_error_code(context, data)
+        check_data_error_code(context, data)
         return data
 
     # Return list of clients. Default lists clients for all decos.
-    async def async_list_clients(
-        self, deco_mac: str = "default", *, timeout_error_retries: int | None = None
-    ) -> list[dict[str, Any]]:
-        """List clients with an optional per-request timeout retry budget."""
-        if timeout_error_retries is not None and (
-            isinstance(timeout_error_retries, bool)
-            or not isinstance(timeout_error_retries, int)
-            or timeout_error_retries < 0
-        ):
-            raise ValueError("Timeout retries must be a non-negative integer")
-
-        return await self._async_call_with_retry(
-            self._async_list_clients,
-            deco_mac,
-            timeout_error_retries=timeout_error_retries,
-        )
+    async def async_list_clients(self, deco_mac="default") -> dict:
+        return await self._async_call_with_retry(self._async_list_clients, deco_mac)
 
     async def _async_list_clients(self, deco_mac) -> dict:
         await self.async_login_if_needed()
@@ -538,19 +427,20 @@ class TplinkDecoApi:
         )
 
         data = self._decrypt_data(context, response_json["data"])
-        self._check_authenticated_data_error_code(context, data)
+        check_data_error_code(context, data)
 
         try:
             client_list = data["result"]["client_list"]
             # client_list is only the connected clients
-            _LOGGER.debug("Deco client-list client_count=%d", len(client_list))
+            _LOGGER.debug("%s client_count=%d", context, len(client_list))
+            _LOGGER.debug("%s client_list=%s", context, client_list)
 
             for client in client_list:
                 client["name"] = decode_name_with_fallback(client["name"])
 
             return client_list
         except Exception as err:
-            _LOGGER.error("Deco client-list parsing failed (%s)", type(err).__name__)
+            _LOGGER.error("%s parse response error=%s, data=%s", context, err, data)
             raise
 
     def _generate_aes_key_and_iv(self):
@@ -559,7 +449,8 @@ class TplinkDecoApi:
         self._aes_iv = secrets.randbelow(MAX_AES_KEY - MIN_AES_KEY) + MIN_AES_KEY
         self._aes_key_bytes = str(self._aes_key).encode("utf-8")
         self._aes_iv_bytes = str(self._aes_iv).encode("utf-8")
-        _LOGGER.debug("Deco request encryption initialized")
+        _LOGGER.debug("aes_key=%s", self._aes_key)
+        _LOGGER.debug("aes_iv=%s", self._aes_iv)
 
     # Fetch password RSA keys
     async def _async_fetch_keys(self):
@@ -575,10 +466,15 @@ class TplinkDecoApi:
             keys = response_json["result"]["password"]
             self._password_rsa_n = int(keys[0], 16)
             self._password_rsa_e = int(keys[1], 16)
-            _LOGGER.debug("Deco password encryption key received")
-
+            _LOGGER.debug("password_rsa_n=%s", self._password_rsa_n)
+            _LOGGER.debug("password_rsa_e=%s", self._password_rsa_e)
         except Exception as err:
-            _LOGGER.error("Deco password key parsing failed (%s)", type(err).__name__)
+            _LOGGER.error(
+                "%s parse response error=%s, response_json=%s",
+                context,
+                err,
+                response_json,
+            )
             raise
 
     # Fetch sign RSA keys and seq no
@@ -595,13 +491,18 @@ class TplinkDecoApi:
             auth_result = response_json["result"]
             auth_key = auth_result["key"]
             self._sign_rsa_n = int(auth_key[0], 16)
-            _LOGGER.debug("Deco request signing key received")
+            _LOGGER.debug("sign_rsa_n=%s", self._sign_rsa_n)
             self._sign_rsa_e = int(auth_key[1], 16)
-            self._seq = auth_result["seq"]
+            _LOGGER.debug("sign_rsa_e=%s", self._sign_rsa_e)
 
+            self._seq = auth_result["seq"]
+            _LOGGER.debug("seq=%s", self._seq)
         except Exception as err:
             _LOGGER.error(
-                "Deco signing parameters parsing failed (%s)", type(err).__name__
+                "%s parse response error=%s, response_json=%s",
+                context,
+                err,
+                response_json,
             )
             raise
 
@@ -610,33 +511,18 @@ class TplinkDecoApi:
             await self.async_login()
 
     async def async_login(self) -> None:
-        """Share one login while isolating waiter and owner cancellation."""
-        if self._login_future is not None:
-            # Cancelling a waiting poll must not cancel the shared login.
-            await asyncio.shield(self._login_future)
-            return
+        """Log in to the Deco, sharing concurrent login requests."""
+        task = self._login_task
 
-        login_future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
-        self._login_future = login_future
+        if task is None:
+            task = asyncio.create_task(self._async_login())
+            self._login_task = task
+
         try:
-            await self._async_login()
-        except asyncio.CancelledError:
-            # An interrupted login may have only a partial session.
-            self.clear_auth()
-            login_future.cancel()
-            raise
-        except Exception as err:
-            login_future.set_exception(err)
-            raise
-        else:
-            login_future.set_result(True)
+            await task
         finally:
-            # Retrieve an owner failure even when nobody joined the login.
-            # Never await the future here: cancellation must not deadlock.
-            if login_future.done() and not login_future.cancelled():
-                login_future.exception()
-            if self._login_future is login_future:
-                self._login_future = None
+            if self._login_task is task:
+                self._login_task = None
 
     async def _async_login(self):
         if self._aes_key is None:
@@ -664,10 +550,10 @@ class TplinkDecoApi:
             )
         except ForbiddenException as err:
             raise LoginForbiddenException(
-                (
-                    "Login auth error. Likely caused by logging in with admin account on another device."
-                    " See https://github.com/amosyuen/ha-tplink-deco#manager-account."
-                )
+
+                "Login auth error. Likely caused by logging in with admin account on another device."
+                " See https://github.com/amosyuen/ha-tplink-deco#manager-account."
+
             ) from err
 
         data = self._decrypt_data(context, response_json["data"])
@@ -678,15 +564,15 @@ class TplinkDecoApi:
                 self.clear_auth()
                 attempts = result.get("attemptsAllowed", "unknown")
                 raise LoginInvalidException(attempts)
-            raise UnexpectedApiException("Deco login request was rejected")
+            raise UnexpectedApiException(f"Login error data={data}")
         check_data_error_code(context, data)
 
         try:
             self._stok = result["stok"]
-            _LOGGER.debug("Deco authenticated session established")
+            _LOGGER.debug("stok=%s", self._stok)
         except Exception as err:
-            _LOGGER.error("Deco login result parsing failed (%s)", type(err).__name__)
-            raise UnexpectedApiException("Deco login response is malformed") from None
+            _LOGGER.error("%s parse response error=%s, data=%s", context, err, data)
+            raise UnexpectedApiException from err
 
         if self._cookie is None:
             raise UnexpectedApiException(
@@ -696,68 +582,23 @@ class TplinkDecoApi:
         # Login success
         self._auth_errors = 0
 
-    def _update_https_host_after_redirect(
-        self, response: aiohttp.ClientResponse
-    ) -> None:
-        """Upgrade only after a same-router HTTP 307 redirect to HTTPS."""
-        if not response.history or not self._host.startswith("http://"):
-            return
-
-        first_response = response.history[0]
-        configured_hostname = urlsplit(self._host).hostname
-        if (
-            first_response.status != 307
-            or first_response.url.scheme != "http"
-            or response.url.scheme != "https"
-            or not configured_hostname
-            or first_response.url.host != configured_hostname
-            or response.url.host != configured_hostname
-        ):
-            return
-
-        # Follow the redirected HTTPS port as well as its scheme.
-        self._host = str(response.url.origin())
-        _LOGGER.debug("Deco API switched to HTTPS after same-host 307 redirect")
-
     async def _async_post(
         self,
         context: str,
         url: str,
-        params: dict[str:Any],
-        data: Any,
-    ) -> dict:
-        """Send a Deco API request and detect expiration of authenticated sessions."""
-        authenticated_request = self._stok not in (None, "") and url.startswith(
-            f"{self._host}/cgi-bin/luci/;stok={self._stok}/"
-        )
-        mobile_usage_request = (
-            context == "Get mobile data usage" and params.get("form") == "internet"
-        )
-        system_log_build_request = (
-            context == SYSTEM_LOG_CONTEXT and params.get("form") == "feedback_log"
-        )
-        private_status_request = (
-            params.get("form") == "wlan"
-            or mobile_usage_request
-            or system_log_build_request
-        )
-        private_label = (
-            "System log"
-            if system_log_build_request
-            else ("Mobile data" if mobile_usage_request else "Wireless status")
-        )
+        params: dict[str, object],
+        data: object,
+    ) -> dict[str, object]:
         headers = {CONTENT_TYPE: "application/json"}
         # Gebruik een dictionary voor cookies in plaats van een string in headers
         request_cookies = {}
         if self._cookie is not None:
-            try:
-                # Split 'sysauth=abc' naar {'sysauth': 'abc'}
-                cookie_parts = self._cookie.split("=", 1)
-                if len(cookie_parts) == 2:
-                    request_cookies[cookie_parts[0]] = cookie_parts[1]
-            except Exception:
-                _LOGGER.warning("Could not parse session cookie")
-        forbidden_message: str | None = None
+            # Split 'sysauth=abc' naar {'sysauth': 'abc'}
+            cookie_name, separator, cookie_value = self._cookie.partition("=")
+            if separator:
+                request_cookies[cookie_name] = cookie_value
+            else:
+                _LOGGER.warning("Could not parse cookie: %s", self._cookie)
         try:
             async with async_timeout.timeout(self._timeout_seconds):
                 response = await self._session.post(
@@ -769,130 +610,92 @@ class TplinkDecoApi:
                     ssl=self._ssl_context,
                 )
                 response.raise_for_status()
-                self._update_https_host_after_redirect(response)
+
+                # Some Deco firmwares 307-redirect every http:// request to
+                # https:// on the same host. aiohttp >= 3.14 (HA 2026.7+)
+                # correctly drops per-request cookies on such cross-origin
+                # (scheme-change) redirects per RFC 6265, so the sysauth
+                # cookie never reaches the router and authenticated calls
+                # return empty data. Permanently switch the base URL to
+                # https so subsequent requests skip the redirect entirely.
+                if (
+                    response.history
+                    and response.url.scheme == "https"
+                    and self._host.startswith("http://")
+                    and response.url.host == response.history[0].url.host
+                ):
+                    self._host = "https://" + self._host[len("http://"):]
+                    _LOGGER.warning(
+                        "%s: Router redirected to HTTPS, switching host to %s",
+                        context,
+                        self._host,
+                    )
 
                 # Verbeterde extractie: loop door alle Set-Cookie headers
                 for cookie_header in response.headers.getall(SET_COOKIE, []):
                     match = re.search(r"(sysauth=[a-f0-9]+)", cookie_header)
                     if match:
                         self._cookie = match.group(1)
-                        _LOGGER.debug("Deco session cookie updated")
+                        _LOGGER.debug("Found new cookie: %s", self._cookie)
                         break
 
                 # Soms antwoordt de server met de verkeerde content-type
-                try:
-                    response_json = await response.json(content_type=None)
-                except (TypeError, ValueError):
-                    if mobile_usage_request or system_log_build_request:
-                        raise UnexpectedApiException(
-                            f"{private_label} response is malformed"
-                        ) from None
-                    raise
-                if private_status_request and not isinstance(response_json, dict):
-                    raise UnexpectedApiException(
-                        f"{private_label} response is malformed"
-                    )
+                response_json = await response.json(content_type=None)
                 if "error_code" in response_json:
                     error_code = response_json.get("error_code")
-                    if error_code == -5002 and authenticated_request:
-                        self.clear_auth()
-                        raise EmptyDataException(
-                            f"{context} authenticated session expired (error_code=-5002)"
-                        )
                     if error_code != 0 and error_code != "":
-                        if private_status_request:
-                            _LOGGER.debug("%s returned API error", context)
-                        else:
-                            _LOGGER.debug("Deco API response reported an error")
-                        if private_status_request:
-                            raise UnexpectedApiException(
-                                f"{private_label} request was rejected"
-                            ) from None
-                        safe_code = error_code if type(error_code) is int else "unknown"
-                        raise UnexpectedApiException(
-                            f"Deco API request rejected (error_code={safe_code})"
+                        _LOGGER.debug(
+                            "%s error_code=%s, response_json=%s",
+                            context,
+                            error_code,
+                            response_json,
                         )
+                        raise UnexpectedApiException(f"{context} error: {error_code}")
 
                 return response_json
         except asyncio.TimeoutError as err:
-            _LOGGER.debug("Deco API request timed out")
-            if mobile_usage_request or system_log_build_request:
-                raise TimeoutException from None
+            _LOGGER.debug(
+                "%s timed out",
+                context,
+            )
             raise TimeoutException from err
-        except aiohttp.ClientResponseError as err:
-            if private_status_request:
-                # aiohttp errors can contain a LuCI token in request_info.
-                _LOGGER.debug("%s HTTP error: %d", private_label, err.status)
-            elif err.status in (401, 403):
-                # A status exception's request_info may include LuCI tokens.
-                _LOGGER.debug("Deco API authentication HTTP error: %d", err.status)
-            elif params.get("form") == "client_list" and 500 <= err.status < 600:
-                # aiohttp exceptions can contain a LuCI session token in
-                # request_info.real_url. Never interpolate these exceptions.
-                _LOGGER.debug("Deco client-list server error: HTTP %d", err.status)
-            else:
-                # An aiohttp error may embed its URL and credentials.
-                _LOGGER.error("Deco API HTTP error: %d", err.status)
+        except ClientResponseError as err:
+            _LOGGER.debug(
+                "%s client response error: %s",
+                context,
+                err,
+            )
             if err.status == 401:
                 self.clear_auth()
-                if mobile_usage_request or system_log_build_request:
-                    # Use the shared bounded re-login path.
-                    raise ForbiddenException(
-                        f"{private_label} forbidden (HTTP 401)"
-                    ) from None
-                raise err
-            if err.status == 403:
-                self.clear_auth()
-                # Raise after leaving except so the raw aiohttp exception is
-                # not retained as the new exception's cause or context.
-                forbidden_message = (
-                    f"{private_label} forbidden (HTTP 403)"
-                    if private_status_request
-                    else "Deco API authentication forbidden (HTTP 403)"
-                )
-            elif mobile_usage_request or system_log_build_request:
-                raise UnexpectedApiException(
-                    f"{private_label} HTTP request failed"
-                ) from None
-            else:
-                raise err
-        except (aiohttp.ClientPayloadError, aiohttp.ServerDisconnectedError) as err:
-            # Truncated responses and disconnects can be retried without
-            # invalidating a previously authenticated session.
-            _LOGGER.debug("Deco API incomplete response: %s", type(err).__name__)
-            # Suppress raw aiohttp error context: it can contain tokens in
-            # an automatically formatted Home Assistant traceback.
-            raise TransientConnectionException(
-                "Deco API response was incomplete"
-            ) from None
-        except aiohttp.ClientConnectorError as err:
-            # Network failures do not prove authentication expired.
-            if private_status_request:
-                _LOGGER.debug(
-                    "%s connection failed (%s)", private_label, type(err).__name__
-                )
-            else:
-                _LOGGER.error("Deco API connection failed (%s)", type(err).__name__)
-            if mobile_usage_request or system_log_build_request:
-                raise UnexpectedApiException(
-                    f"{private_label} connection failed"
-                ) from None
-            raise
-        except aiohttp.ClientError as err:
-            if private_status_request:
-                _LOGGER.debug(
-                    "%s transport failed (%s)", private_label, type(err).__name__
-                )
-            else:
-                _LOGGER.error("Deco API transport failed (%s)", type(err).__name__)
-            if mobile_usage_request or system_log_build_request:
-                raise UnexpectedApiException(
-                    f"{private_label} transport failed"
-                ) from None
-            raise
+                raise
 
-        if forbidden_message is not None:
-            raise ForbiddenException(forbidden_message) from None
+            if context == "Logout" and err.status == 403:
+                _LOGGER.debug("Logout rejected by Deco: %s", err)
+                return {}
+
+            _LOGGER.error(
+                "%s client response error: %s",
+                context,
+                err,
+            )
+            raise
+        except (ClientConnectorError, ServerDisconnectedError) as err:
+            # Do NOT clear auth here — a transient network error does not mean
+            # the session is invalid. Clearing auth causes a re-login which creates
+            # a new session on the Deco, leading to session table exhaustion.
+            _LOGGER.warning(
+                "%s connection error (keeping session): %s",
+                context,
+                err,
+            )
+            raise
+        except ClientError as err:
+            _LOGGER.error(
+                "%s client error: %s",
+                context,
+                err,
+            )
+            raise
 
     def _encode_payload(self, payload: Any):
         data = self._encode_data(payload)
@@ -901,29 +704,48 @@ class TplinkDecoApi:
         payload = f"sign={sign}&data={quote_plus(data)}"
         return payload
 
-    def _encode_sign(self, data_len: int):
+    def _encode_sign(self, data_len: int) -> str:
+        """Create the RSA-encrypted request signature."""
         if self._seq is None:
-            self.clear_auth()
-            message = "_seq is None"
-            raise EmptyDataException(message)
+            raise EmptyDataException("_seq is None, login required")
+
+        if self._sign_rsa_n is None or self._sign_rsa_e is None:
+            raise EmptyDataException("RSA signing keys are not initialized, login required")
+
+        if self._aes_key is None or self._aes_iv is None:
+            raise EmptyDataException("AES encryption keys are not initialized, login required")
+
         seq_with_data_len = self._seq + data_len
-        auth_hash = (
-            hashlib.md5(f"{self._username}{self._password}".encode()).digest().hex()
-        )
+        auth_hash = hashlib.md5(
+            f"{self._username}{self._password}".encode()
+        ).hexdigest()
+
         sign_text = (
             f"k={self._aes_key}&i={self._aes_iv}&h={auth_hash}&s={seq_with_data_len}"
         )
-        sign = rsa_encrypt(self._sign_rsa_n, self._sign_rsa_e, sign_text.encode())
-        return sign
 
-    def _encode_data(self, payload: Any):
+        return rsa_encrypt(
+            self._sign_rsa_n,
+            self._sign_rsa_e,
+            sign_text.encode(),
+        )
+
+    def _encode_data(self, payload: object) -> str:
+        """Serialize and AES-encrypt a payload for the Deco API."""
+        if self._aes_key_bytes is None or self._aes_iv_bytes is None:
+            raise EmptyDataException(
+                "AES encryption keys are not initialized, login required"
+            )
+
         payload_json = json.dumps(payload, separators=(",", ":"))
 
         data_encrypted = aes_encrypt(
-            self._aes_key_bytes, self._aes_iv_bytes, payload_json.encode()
+            self._aes_key_bytes,
+            self._aes_iv_bytes,
+            payload_json.encode(),
         )
-        data = base64.b64encode(data_encrypted).decode()
-        return data
+
+        return base64.b64encode(data_encrypted).decode()
 
     def clear_auth(self):
         _LOGGER.debug("clear_auth")
@@ -932,127 +754,112 @@ class TplinkDecoApi:
         self._cookie = None
 
     async def async_logout(self) -> None:
-        """Best-effort router logout; always clear the local session."""
+        """Log out from the Deco to release the admin session."""
         if self._stok is None or self._cookie is None:
             self.clear_auth()
             return
 
         try:
+            _LOGGER.debug("Logging out from Deco")
+
+            logout_payload = {"operation": "logout"}
+
             await self._async_post(
                 "Logout",
                 f"{self._host}/cgi-bin/luci/;stok={self._stok}/admin/system",
                 params={"form": "logout"},
-                data=self._encode_payload({"operation": "logout"}),
+                data=json.dumps(logout_payload),
             )
-        except Exception as err:
-            # An offline router must not prevent Home Assistant from unloading.
-            # Never include an upstream exception or session token in logs.
-            _LOGGER.debug("Deco logout failed: %s", type(err).__name__)
+        except ForbiddenException as err:
+            _LOGGER.debug("Logout rejected by Deco: %s", err)
+        except (TimeoutException, ClientError) as err:
+            _LOGGER.debug("Logout failed (best effort): %s", err)
         finally:
             self.clear_auth()
 
-    def _check_authenticated_data_error_code(
-        self, context: str, data: dict[str, Any]
-    ) -> None:
-        """Invalidate a rejected authenticated session and trigger one re-login."""
-        if data.get("error_code") == -5002 or data.get("errorcode") == -5002:
-            self.clear_auth()
-            raise EmptyDataException(
-                f"{context} authenticated session expired (error_code=-5002)"
-            )
-        check_data_error_code(context, data)
+    def _decrypt_data(self, context: str, data: str) -> dict[str, object]:
+        """Decrypt, decode, and deserialize a Deco API response."""
+        if not data:
+            raise EmptyDataException(f"{context} data is empty")
 
-    def _decrypt_data(self, context: str, data: str):
-        if data == "":
-            self.clear_auth()
-            message = f"{context} data is empty"
-            raise EmptyDataException(message)
+        if self._aes_key_bytes is None or self._aes_iv_bytes is None:
+            raise EmptyDataException(
+                f"{context} AES decryption keys are not initialized, login required"
+            )
 
         try:
-            data_decoded = base64.b64decode(data)
+            data_decoded = base64.b64decode(data, validate=True)
             data_decrypted = aes_decrypt(
-                self._aes_key_bytes, self._aes_iv_bytes, data_decoded
+                self._aes_key_bytes,
+                self._aes_iv_bytes,
+                data_decoded,
             )
-            # Remove the PKCS #7 padding
-            num_padding_bytes = int(data_decrypted[-1])
-            data_decrypted = data_decrypted[:-num_padding_bytes].decode()
-            data_json = json.loads(data_decrypted)
-            return data_json
-        except Exception as err:
-            if context in (
-                "Get wireless status",
-                "Get mobile data usage",
-                SYSTEM_LOG_CONTEXT,
-            ):
-                private_label = (
-                    "System log"
-                    if context == SYSTEM_LOG_CONTEXT
-                    else (
-                        "Mobile data"
-                        if context == "Get mobile data usage"
-                        else "Wireless status"
-                    )
-                )
-                _LOGGER.debug(
-                    "%s response decoding failed (%s)",
-                    private_label,
-                    type(err).__name__,
-                )
-                raise UnexpectedApiException(
-                    f"{private_label} response could not be decoded"
-                ) from None
-            _LOGGER.error("Deco API response decoding failed (%s)", type(err).__name__)
-            raise
 
-    async def _async_call_with_retry(
-        self,
-        func,
-        *args,
-        timeout_error_retries: int | None = None,
-        transient_error_retries: int | None = None,
-    ):
-        """Bound timeout, incomplete-response and authentication retries."""
-        max_timeout_retries = (
-            self._timeout_error_retries
-            if timeout_error_retries is None
-            else timeout_error_retries
-        )
-        max_transient_retries = (
-            self._timeout_error_retries
-            if transient_error_retries is None
-            else transient_error_retries
-        )
+            # Remove PKCS #7 padding.
+            num_padding_bytes = data_decrypted[-1]
+            block_size = algorithms.AES.block_size // 8
+
+            if not 1 <= num_padding_bytes <= block_size:
+                raise ValueError(
+                    f"Invalid PKCS #7 padding length: {num_padding_bytes}"
+                )
+
+            padding = bytes([num_padding_bytes]) * num_padding_bytes
+            if data_decrypted[-num_padding_bytes:] != padding:
+                raise ValueError("Invalid PKCS #7 padding")
+
+            decoded_data = data_decrypted[:-num_padding_bytes].decode("utf-8")
+            data_json = json.loads(decoded_data)
+
+            if not isinstance(data_json, dict):
+                raise TypeError(
+                    f"{context} response JSON must be an object, "
+                    f"got {type(data_json).__name__}"
+                )
+
+            return data_json
+
+        except (binascii.Error, UnicodeDecodeError, ValueError) as err:
+            _LOGGER.error("%s decode data error=%s", context, err)
+            _LOGGER.debug(
+                "%s decode data error=%s, data=%s",
+                context,
+                err,
+                data,
+            )
+            raise EmptyDataException(
+                f"{context} could not decode response"
+            ) from err
+
+    async def _async_call_with_retry(self, func, *args):
+        """Call API function with retry logic and request serialization."""
+        async with self._request_lock:
+            return await self._async_call_with_retry_inner(func, *args)
+
+    async def _async_call_with_retry_inner(self, func, *args):
         relogin_retried = False
         timeout_retries = 0
-        transient_retries = 0
         while True:
             try:
                 return await func(*args)
             except (EmptyDataException, ForbiddenException) as err:
                 if relogin_retried:
                     # Reached max relogin retries
-                    raise err
+                    raise
                 relogin_retried = True
                 _LOGGER.debug(
                     "Re-login and retry potential expired auth error: %s",
                     err,
                 )
-            except TimeoutException:
-                if timeout_retries >= max_timeout_retries:
+                self.clear_auth()
+            except TimeoutException as err:
+                if timeout_retries >= self._timeout_error_retries:
                     # Reached max retries
                     raise
                 timeout_retries += 1
                 _LOGGER.debug(
-                    "Retry (%d of %d) timeout error",
+                    "Retry (%d of %d) timeout error: %s",
                     timeout_retries,
-                    max_timeout_retries,
-                )
-            except TransientConnectionException:
-                if transient_retries >= max_transient_retries:
-                    raise
-                transient_retries += 1
-                _LOGGER.debug(
-                    "Retry (%d of %d) incomplete Deco API response",
-                    transient_retries,
-                    max_transient_retries,
+                    self._timeout_error_retries,
+                    err,
                 )

@@ -1,0 +1,40 @@
+reboot:
+  name: Reboot
+  description: Reboot a TP-Link Deco node.
+  target:
+    entity:
+      domain: button
+      integration: tplink_deco
+reboot_deco:
+  name: Reboot Deco
+  description: Reboot a TP-Link Deco node.
+  fields:
+    device_id:
+      name: Device ID(s)
+      description: Device ID(s)
+      required: true
+      example: "AA:BB:CC:DD:EE:FF"
+      selector:
+        device:
+          integration: tplink_deco
+          manufacturer: TP-Link
+          multiple: true
+
+new_reboot_deco:
+  name: Reboot Deco
+  description: Reboot a TP-Link Deco node.
+  target:
+    device:
+      integration: tplink_deco
+      manufacturer: TP-Link
+
+reboot_all:
+  name: Reboot All
+  description: Reboot all Deco nodes in the network (triggers a full mesh reboot via the master).
+  target:
+    device:
+      integration: tplink_deco
+      
+reboot_all_decos:
+  name: Reboot All Decos
+  description: Reboot all Deco nodes across all config entries.

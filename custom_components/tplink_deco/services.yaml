@@ -1,50 +1,41 @@
+reboot:
+  name: Reboot
+  description: Reboot a TP-Link Deco node.
+  target:
+    entity:
+      domain: button
+      integration: tplink_deco
+
 reboot_deco:
   name: Reboot Deco
-  description: Reboot Deco
+  description: Reboot a TP-Link Deco node.
   fields:
     device_id:
       name: Device ID(s)
       description: Device ID(s)
       required: true
+      example: "AA:BB:CC:DD:EE:FF"
       selector:
         device:
           integration: tplink_deco
-          manufacturer: TP-Link Deco
+          manufacturer: TP-Link
           multiple: true
-download_system_log:
-  name: Download system log
-  description: >-
-    Download and decode a Deco system log on demand to a private file under
-    the Home Assistant configuration directory. System logs may contain
-    personal or network data; protect and remove exports when no longer needed.
-  fields:
-    config_entry_id:
-      name: Deco configuration
-      description: Required if multiple TP-Link Deco entries are loaded.
-      required: false
-      selector:
-        config_entry:
-          integration: tplink_deco
-    filename:
-      name: File name
-      description: Optional plain ASCII .log name; an existing file is never overwritten.
-      required: false
-      example: deco.log
-      selector:
-        text:
-    log_level:
-      name: Log level
-      description: Minimum severity of lines to include.
-      required: false
-      default: ALL
-      selector:
-        select:
-          options:
-            - ALERT
-            - CRITICAL
-            - ERROR
-            - WARNING
-            - NOTICE
-            - INFO
-            - DEBUG
-            - ALL
+
+new_reboot_deco:
+  name: Reboot Deco
+  description: Reboot a TP-Link Deco node.
+  target:
+    device:
+      integration: tplink_deco
+      manufacturer: TP-Link
+
+reboot_all:
+  name: Reboot All
+  description: Reboot all Deco nodes in the network (triggers a full mesh reboot via the master).
+  target:
+    device:
+      integration: tplink_deco
+      
+reboot_all_decos:
+  name: Reboot All Decos
+  description: Reboot all Deco nodes across all config entries.

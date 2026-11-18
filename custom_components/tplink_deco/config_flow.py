@@ -4,107 +4,59 @@ import asyncio
 import logging
 from typing import Any
 
-import aiohttp
-from homeassistant import config_entries
-from homeassistant.components.device_tracker.const import CONF_CONSIDER_HOME
-from homeassistant.components.device_tracker.const import CONF_SCAN_INTERVAL
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_HOST
-from homeassistant.const import CONF_PASSWORD
-from homeassistant.const import CONF_USERNAME
-from homeassistant.core import HomeAssistant
-from homeassistant.core import callback
-from homeassistant.exceptions import ConfigEntryAuthFailed
-from homeassistant.exceptions import ConfigEntryNotReady
-from homeassistant.helpers import selector
 import voluptuous as vol
+from homeassistant import config_entries
+from homeassistant.components.device_tracker.const import (
+    CONF_CONSIDER_HOME,
+    CONF_SCAN_INTERVAL,
+)
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_USERNAME
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.helpers import selector
 
 from .__init__ import async_create_and_refresh_coordinators
-from .const import CONF_CLIENT_POSTFIX
-from .const import CONF_CLIENT_PREFIX
-from .const import CONF_DECO_POSTFIX
-from .const import CONF_DECO_PREFIX
-from .const import CONF_DEVICE_LIST_INTERVAL
-from .const import CONF_EXPOSE_WIFI_SSIDS
-from .const import CONF_LINK_CLIENT_DEVICES
-from .const import CONF_TIMEOUT_ERROR_RETRIES
-from .const import CONF_TIMEOUT_SECONDS
-from .const import CONF_VERIFY_SSL
-from .const import COORDINATOR_CLIENTS_KEY
-from .const import COORDINATOR_DECOS_KEY
-from .const import COORDINATOR_MOBILE_KEY
-from .const import COORDINATOR_WIRELESS_KEY
-from .const import DEFAULT_CONSIDER_HOME
-from .const import DEFAULT_DECO_POSTFIX
-from .const import DEFAULT_EXPOSE_WIFI_SSIDS
-from .const import DEFAULT_LINK_CLIENT_DEVICES
-from .const import DEFAULT_SCAN_INTERVAL
-from .const import DEFAULT_TIMEOUT_ERROR_RETRIES
-from .const import DEFAULT_TIMEOUT_SECONDS
-from .const import DOMAIN
+from .const import (
+    CONF_CLIENT_POSTFIX,
+    CONF_CLIENT_PREFIX,
+    CONF_DECO_POSTFIX,
+    CONF_DECO_PREFIX,
+    CONF_TIMEOUT_ERROR_RETRIES,
+    CONF_TIMEOUT_SECONDS,
+    CONF_VERIFY_SSL,
+    COORDINATOR_CLIENTS_KEY,
+    COORDINATOR_DECOS_KEY,
+    DEFAULT_CONSIDER_HOME,
+    DEFAULT_DECO_POSTFIX,
+    DEFAULT_SCAN_INTERVAL,
+    DEFAULT_TIMEOUT_ERROR_RETRIES,
+    DEFAULT_TIMEOUT_SECONDS,
+    DOMAIN,
+)
 from .exceptions import TimeoutException
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
-
-SCAN_INTERVAL_OPTIONS = (10, 30, 60, 120)
+SCAN_INTERVAL_OPTIONS = [10, 30, 60, 120]
 SCAN_INTERVAL_SELECTOR_OPTIONS = [str(value) for value in SCAN_INTERVAL_OPTIONS]
 
 
-def _parse_scan_interval(value: Any) -> int | None:
-    """Parse a supported interval without accepting booleans or floats."""
-    if isinstance(value, bool) or not isinstance(value, (int, str)):
-        return None
+def _get_scan_interval(data: dict[str:Any]) -> str:
+    scan_interval = data.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
     try:
-        interval = int(value)
-    except ValueError:
-        return None
-    return interval if interval in SCAN_INTERVAL_OPTIONS else None
+        scan_interval = int(scan_interval)
+    except (TypeError, ValueError):
+        scan_interval = DEFAULT_SCAN_INTERVAL
+
+    if scan_interval not in SCAN_INTERVAL_OPTIONS:
+        scan_interval = DEFAULT_SCAN_INTERVAL
+
+    return str(scan_interval)
 
 
-def _get_scan_interval(data: dict[str, Any]) -> str:
-    """Return a supported scan interval as a string for the form selector."""
-    interval = _parse_scan_interval(data.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL))
-    return str(interval if interval is not None else DEFAULT_SCAN_INTERVAL)
-
-
-def _normalize_scan_interval(data: dict[str, Any]) -> bool:
-    """Validate a submitted interval and preserve integer config storage."""
-    if CONF_SCAN_INTERVAL not in data:
-        return True
-    interval = _parse_scan_interval(data[CONF_SCAN_INTERVAL])
-    if interval is None:
-        return False
-    data[CONF_SCAN_INTERVAL] = interval
-    return True
-
-
-def _parse_device_list_interval(value: Any) -> int | None:
-    """Accept startup-only zero or a positive interval of at least ten seconds."""
-    if isinstance(value, bool) or not isinstance(value, (int, str)):
-        return None
-    try:
-        interval = int(value)
-    except ValueError:
-        return None
-    return interval if interval == 0 or interval >= 10 else None
-
-
-def _normalize_device_list_interval(data: dict[str, Any]) -> bool:
-    """Normalize the independent interval without changing the main cadence."""
-    if CONF_DEVICE_LIST_INTERVAL not in data:
-        return True
-    interval = _parse_device_list_interval(data[CONF_DEVICE_LIST_INTERVAL])
-    if interval is None:
-        return False
-    data[CONF_DEVICE_LIST_INTERVAL] = interval
-    return True
-
-
-def _valid_ssid_choice(data: dict[str, Any]) -> bool:
-    """Reject non-boolean SSID consent before network access or persistence."""
-    return CONF_EXPOSE_WIFI_SSIDS not in data or isinstance(
-        data[CONF_EXPOSE_WIFI_SSIDS], bool
-    )
+def _normalize_scan_interval(data: dict[str:Any]) -> None:
+    if CONF_SCAN_INTERVAL in data:
+        data[CONF_SCAN_INTERVAL] = int(data[CONF_SCAN_INTERVAL])
 
 
 def _get_auth_schema(data: dict[str:Any]):
@@ -121,11 +73,6 @@ def _get_schema(data: dict[str:Any]):
         data = {}
     schema = _get_auth_schema(data)
     scan_interval = _get_scan_interval(data)
-    device_list_interval = _parse_device_list_interval(
-        data.get(CONF_DEVICE_LIST_INTERVAL, scan_interval)
-    )
-    if device_list_interval is None:
-        device_list_interval = int(scan_interval)
 
     schema.update(
         {
@@ -141,10 +88,6 @@ def _get_schema(data: dict[str:Any]):
                     mode=selector.SelectSelectorMode.DROPDOWN,
                 )
             ),
-            vol.Required(
-                CONF_DEVICE_LIST_INTERVAL,
-                default=device_list_interval,
-            ): vol.All(vol.Coerce(int), vol.Range(min=0)),
             vol.Required(
                 CONF_CONSIDER_HOME,
                 default=data.get(CONF_CONSIDER_HOME, DEFAULT_CONSIDER_HOME),
@@ -162,15 +105,6 @@ def _get_schema(data: dict[str:Any]):
             vol.Required(
                 CONF_VERIFY_SSL,
                 default=data.get(CONF_VERIFY_SSL, True),
-            ): bool,
-            vol.Required(
-                CONF_LINK_CLIENT_DEVICES,
-                default=data.get(CONF_LINK_CLIENT_DEVICES, DEFAULT_LINK_CLIENT_DEVICES),
-            ): bool,
-            vol.Required(
-                CONF_EXPOSE_WIFI_SSIDS,
-                default=data.get(CONF_EXPOSE_WIFI_SSIDS, DEFAULT_EXPOSE_WIFI_SSIDS)
-                is True,
             ): bool,
             vol.Optional(
                 CONF_CLIENT_PREFIX,
@@ -207,62 +141,37 @@ def _ensure_user_input_optionals(data: dict[str:Any]) -> None:
             data[key] = ""
 
 
-async def _async_test_credentials(
-    hass: HomeAssistant, data: dict[str, Any]
-) -> dict[str, str]:
-    """Check credentials and expose only sanitized form errors."""
+async def _async_test_credentials(hass: HomeAssistant, data: dict[str:Any]):
+    """Return true if credentials is valid."""
     try:
-        coordinators = await async_create_and_refresh_coordinators(hass, data)
-    except (TimeoutException, asyncio.TimeoutError):
-        _LOGGER.debug("Deco credential check timed out")
+        coordinators = await async_create_and_refresh_coordinators(
+            hass,
+            data,
+        )
+        await asyncio.gather(
+            coordinators[COORDINATOR_DECOS_KEY].async_shutdown(),
+            coordinators[COORDINATOR_CLIENTS_KEY].async_shutdown(),
+        )
+        return {}
+    except TimeoutException:
         return {"base": "timeout_connect"}
-    except ConfigEntryAuthFailed:
-        _LOGGER.debug("Deco credentials rejected")
+    except ConfigEntryAuthFailed as err:
+        _LOGGER.error("Error authenticating credentials: %s", err)
         return {"base": "invalid_auth"}
-    except (ConfigEntryNotReady, aiohttp.ClientConnectionError):
-        _LOGGER.debug("Deco host unavailable during credential check")
+    except ConfigEntryNotReady as err:
+        _LOGGER.error("Error connection to host: %s", err)
         return {"base": "invalid_host"}
     except Exception as err:
-        # Upstream error messages may contain passwords, tokens or router URLs.
-        _LOGGER.error(
-            "Unexpected Deco credential check failure (%s)", type(err).__name__
-        )
+        _LOGGER.error("Error testing credentials: %s", err)
+        raise err
         return {"base": "unknown"}
-
-    shutdown_results = await asyncio.gather(
-        *(
-            coordinator.async_shutdown()
-            for key, coordinator in coordinators.items()
-            if key
-            in (
-                COORDINATOR_DECOS_KEY,
-                COORDINATOR_CLIENTS_KEY,
-                COORDINATOR_MOBILE_KEY,
-                COORDINATOR_WIRELESS_KEY,
-            )
-        ),
-        return_exceptions=True,
-    )
-    for result in shutdown_results:
-        if isinstance(result, asyncio.CancelledError):
-            raise result
-
-    for result in shutdown_results:
-        if isinstance(result, BaseException):
-            if not isinstance(result, Exception):
-                raise result
-            _LOGGER.error(
-                "Unexpected Deco temporary coordinator shutdown failure (%s)",
-                type(result).__name__,
-            )
-            return {"base": "unknown"}
-    return {}
 
 
 class TplinkDecoFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
     """Config flow for tplink_deco."""
 
-    VERSION = 7
+    VERSION = 6
+    CONNECTION_CLASS = config_entries.CONN_CLASS_CLOUD_POLL
     reauth_entry: ConfigEntry = None
 
     def __init__(self):
@@ -274,21 +183,12 @@ class TplinkDecoFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         self._errors = {}
 
         if user_input is not None:
-            candidate_data = dict(user_input)
-            if not _normalize_scan_interval(candidate_data):
-                self._errors = {CONF_SCAN_INTERVAL: "invalid_scan_interval"}
-            elif not _normalize_device_list_interval(candidate_data):
-                self._errors = {
-                    CONF_DEVICE_LIST_INTERVAL: "invalid_device_list_interval"
-                }
-            elif not _valid_ssid_choice(candidate_data):
-                self._errors = {CONF_EXPOSE_WIFI_SSIDS: "invalid_expose_wifi_ssids"}
-            else:
-                self._errors = await _async_test_credentials(self.hass, candidate_data)
-            if not self._errors:
-                _ensure_user_input_optionals(candidate_data)
+            _normalize_scan_interval(user_input)
+            self._errors = await _async_test_credentials(self.hass, user_input)
+            if len(self._errors) == 0:
+                _ensure_user_input_optionals(user_input)
                 return self.async_create_entry(
-                    title=candidate_data[CONF_HOST], data=candidate_data
+                    title=user_input[CONF_HOST], data=user_input
                 )
 
         return self.async_show_form(
@@ -309,6 +209,7 @@ class TplinkDecoFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         self._errors = {}
 
         if user_input is not None:
+            _ensure_user_input_optionals(user_input)
             data = dict(self.reauth_entry.data)
             data.update(user_input)
 
@@ -345,27 +246,18 @@ class TplinkDecoOptionsFlowHandler(config_entries.OptionsFlow):
         self._errors = {}
 
         if user_input is not None:
-            submitted_data = dict(user_input)
-            if not _normalize_scan_interval(submitted_data):
-                self._errors = {CONF_SCAN_INTERVAL: "invalid_scan_interval"}
-            elif not _normalize_device_list_interval(submitted_data):
-                self._errors = {
-                    CONF_DEVICE_LIST_INTERVAL: "invalid_device_list_interval"
-                }
-            elif not _valid_ssid_choice(submitted_data):
-                self._errors = {CONF_EXPOSE_WIFI_SSIDS: "invalid_expose_wifi_ssids"}
-            else:
-                _ensure_user_input_optionals(submitted_data)
-                candidate_data = {**self.data, **submitted_data}
-                self._errors = await _async_test_credentials(self.hass, candidate_data)
-            if not self._errors:
+            _ensure_user_input_optionals(user_input)
+            _normalize_scan_interval(user_input)
+            self.data.update(user_input)
+
+            self._errors = await _async_test_credentials(self.hass, self.data)
+            if len(self._errors) == 0:
                 self.hass.config_entries.async_update_entry(
                     entry=self.config_entry,
-                    title=candidate_data[CONF_HOST],
-                    data=candidate_data,
+                    title=self.data[CONF_HOST],
+                    data=self.data,
                     options={},
                 )
-                self.data = candidate_data
                 return self.async_create_entry(data={})
 
         return self.async_show_form(
