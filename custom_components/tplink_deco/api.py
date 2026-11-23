@@ -48,6 +48,8 @@ PKCS1_v1_5_HEADER_BYTES = 11
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 LEGACY_ERROR_DECODING_PATTERN = re.compile(r"^<Error Decoding (.*)>$")
 SYSTEM_LOG_CONTEXT = "Get System Log"
+GUEST_WIFI_BAND_PATTERN = re.compile(r"band[0-9]+(?:_[0-9]+)*\\Z")
+MAX_GUEST_WIFI_BAND_LENGTH = 32
 
 
 def normalize_name(name: str | None) -> str | None:
@@ -295,6 +297,60 @@ class TplinkDecoApi:
         if not isinstance(result, dict):
             raise UnexpectedApiException("Wireless status response is malformed")
         return result
+
+    async def async_set_guest_wifi(
+        self, bands: tuple[str, ...], enabled: bool
+    ) -> None:
+        """Set validated guest enable flags without changing other WLAN fields."""
+        if type(enabled) is not bool:
+            raise ValueError("Guest WiFi state must be a boolean")
+        if (
+            not bands
+            or len(set(bands)) != len(bands)
+            or any(
+                not isinstance(band, str)
+                or len(band) > MAX_GUEST_WIFI_BAND_LENGTH
+                or GUEST_WIFI_BAND_PATTERN.fullmatch(band) is None
+                for band in bands
+            )
+        ):
+            raise ValueError("Guest WiFi requires unique supported band identifiers")
+
+        # Never use the generic API retry wrapper for a router-setting write:
+        # a timeout or lost acknowledgement may follow an accepted command.
+        failure: str | None = None
+        try:
+            await self.async_login_if_needed()
+            response = await self._async_post(
+                "Set guest WiFi",
+                f"{self._host}/cgi-bin/luci/;stok={self._stok}/admin/wireless",
+                params={"form": "wlan"},
+                data=self._encode_payload(
+                    {
+                        "operation": "write",
+                        "params": {
+                            band: {"guest": {"enable": enabled}} for band in bands
+                        },
+                    }
+                ),
+            )
+            encrypted = response.get("data") if isinstance(response, dict) else None
+            if not isinstance(encrypted, str) or not encrypted:
+                raise UnexpectedApiException("Guest WiFi acknowledgement is missing")
+            payload = self._decrypt_data("Set guest WiFi", encrypted)
+            if (
+                not isinstance(payload, dict)
+                or type(payload.get("error_code", payload.get("errorcode"))) is not int
+                or payload.get("error_code", payload.get("errorcode")) != 0
+                or not isinstance(payload.get("result"), dict)
+            ):
+                raise UnexpectedApiException("Guest WiFi command was not confirmed")
+        except Exception:
+            # Raise outside the exception handler so secrets cannot survive in
+            # __context__, including aiohttp request URLs with LuCI tokens.
+            failure = "Guest WiFi update was not confirmed by the Deco"
+        if failure is not None:
+            raise UnexpectedApiException(failure)
 
     async def async_get_mobile_data_usage(self) -> int | None:
         """Read optional mobile WAN usage in KiB without extra timeout retries."""
@@ -1087,6 +1143,7 @@ class TplinkDecoApi:
         except Exception as err:
             if context in (
                 "Get wireless status",
+                "Set guest WiFi",
                 "Get mobile data usage",
                 SYSTEM_LOG_CONTEXT,
             ):
