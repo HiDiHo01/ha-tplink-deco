@@ -177,6 +177,11 @@
       "reboot_all": {
         "name": "Reboot All"
       }
+    },
+    "switch": {
+      "guest_wifi": {
+        "name": "Guest WiFi"
+      }
     }
   }
 }
