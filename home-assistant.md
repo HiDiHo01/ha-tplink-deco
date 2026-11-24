@@ -662,6 +662,23 @@ not duplicate their general standards.
 
 ## Optional read-only WiFi status (upstream #627)
 
+### Guest-network switch (pending firmware verification)
+
+The optional Guest WiFi `switch` is separate from the existing read-only
+Guest WiFi `binary_sensor`. It is created only after a valid guest-network
+status read and belongs to the current master Deco. User-initiated on/off
+commands re-read supported guest bands, verify master ownership, serialize
+writes, submit only guest enable flags through the authenticated encrypted
+WLAN endpoint, and refresh observed state. No settings change occurs during
+setup or background polling. Unsupported/malformed firmware fields and master
+changes block writes. Write acknowledgement alone is not evidence of state:
+the status readback must match the requested state.
+
+**Not yet confirmed on physical firmware:** partial per-band WLAN `write`
+semantics, whether all band flags are required together, and whether the
+router returns the expected encrypted acknowledgement. Do not describe
+this feature as firmware-tested until validated against a supported device.
+
 The third, entry-owned coordinator reads the local `admin/wireless?form=wlan`
 endpoint independently from the mandatory Deco and client coordinators.
 The optional mobile coordinator merged in PR #43 is the **separate fourth**
