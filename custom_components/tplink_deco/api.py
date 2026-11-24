@@ -303,8 +303,7 @@ class TplinkDecoApi:
         if type(enabled) is not bool or not band_names:
             raise ValueError("Guest WiFi requires an explicit boolean and bands")
         if any(
-            re.fullmatch(r"band[0-9]+(?:_[0-9]+)*", band) is None
-            for band in band_names
+            re.fullmatch(r"band[0-9]+(?:_[0-9]+)*", band) is None for band in band_names
         ) or len(set(band_names)) != len(band_names):
             raise ValueError("Guest WiFi band selection is invalid")
 
@@ -312,9 +311,7 @@ class TplinkDecoApi:
         context = "Set wireless guest network"
         payload = {
             "operation": "write",
-            "params": {
-                band: {"guest": {"enable": enabled}} for band in band_names
-            },
+            "params": {band: {"guest": {"enable": enabled}} for band in band_names},
         }
         # Never retry a write after a timeout or an ambiguous transport failure.
         failure = False
