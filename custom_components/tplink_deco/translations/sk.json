@@ -177,6 +177,11 @@
       "reboot_all": {
         "name": "Reštartovať všetky zariadenia Deco"
       }
+    },
+    "switch": {
+      "guest_wifi": {
+        "name": "Hosťovská Wi-Fi"
+      }
     }
   }
 }
