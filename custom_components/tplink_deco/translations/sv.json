@@ -177,6 +177,11 @@
       "reboot_all": {
         "name": "Starta om alla Deco-enheter"
       }
+    },
+    "switch": {
+      "guest_wifi": {
+        "name": "Gäst-Wi-Fi"
+      }
     }
   }
 }
