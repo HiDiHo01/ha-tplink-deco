@@ -1,5 +1,6 @@
 """Read-only WiFi network status for supported TP-Link Deco firmware."""
 
+import asyncio
 from dataclasses import dataclass
 from datetime import timedelta
 import logging
@@ -200,6 +201,7 @@ class TplinkDecoWirelessUpdateCoordinator(DataUpdateCoordinator[dict[str, bool]]
         self._ssid_master_generation: int | None = None
         self._next_retry = 0.0
         self._consecutive_failures = 0
+        self._guest_write_lock = asyncio.Lock()
         if config_entry is not None:
             config_entry.async_on_unload(
                 deco_coordinator.async_add_listener(self._handle_deco_update)
@@ -244,6 +246,57 @@ class TplinkDecoWirelessUpdateCoordinator(DataUpdateCoordinator[dict[str, bool]]
         ):
             return {}
         return self.ssids.get(network_key, {})
+
+    async def async_set_guest_enabled(self, enabled: bool, master_mac: str) -> None:
+        """Change only confirmed guest bands and reconcile router state."""
+        if type(enabled) is not bool:
+            raise ValueError("Guest WiFi state must be a boolean")
+        async with self._guest_write_lock:
+            current_mac, generation = self._observe_master()
+            if (
+                not master_mac
+                or current_mac != master_mac
+                or self._deco_coordinator.paused
+                or not self.last_update_success
+                or "guest" not in self.data
+            ):
+                raise UpdateFailed("Guest WiFi is not available on the current master")
+
+            # A fresh authenticated read validates all target sections before writing.
+            try:
+                config = await self.api.async_get_wireless()
+            except Exception:
+                raise UpdateFailed("Unable to verify guest WiFi settings") from None
+            if (current_mac, generation) != self._observe_master():
+                raise UpdateFailed("Master Deco changed during guest WiFi validation")
+            if not isinstance(config, dict):
+                raise UpdateFailed("Guest WiFi settings are invalid")
+
+            bands = _resolve_band_sections(config, (("band*", "guest"),))
+            if not bands or len({band for band, _ in bands}) != len(bands):
+                raise UpdateFailed("Guest WiFi bands are unsupported or ambiguous")
+            if any(_parse_enabled(section.get("enable")) is None for _, section in bands):
+                raise UpdateFailed("Guest WiFi band states are not supported")
+
+            selected_bands = tuple(sorted(band for band, _ in bands))
+            try:
+                await self.api.async_set_guest_wireless(selected_bands, enabled)
+            except Exception:
+                # A router may have applied the write before an uncertain failure.
+                raise UpdateFailed(
+                    "Guest WiFi change could not be confirmed; check router state"
+                ) from None
+            if (current_mac, generation) != self._observe_master():
+                raise UpdateFailed("Master Deco changed during guest WiFi update")
+            await self.async_refresh()
+            if (
+                not self.last_update_success
+                or not isinstance(self.data, dict)
+                or self.data.get("guest") is not enabled
+            ):
+                raise UpdateFailed(
+                    "Guest WiFi state could not be verified after the change"
+                )
 
     @property
     def retry_remaining_seconds(self) -> int:
