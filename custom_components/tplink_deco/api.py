@@ -296,6 +296,52 @@ class TplinkDecoApi:
             raise UnexpectedApiException("Wireless status response is malformed")
         return result
 
+    async def async_set_guest_wireless(
+        self, band_names: tuple[str, ...], enabled: bool
+    ) -> None:
+        """Submit one explicit guest-network write without automatic retries."""
+        if type(enabled) is not bool or not band_names:
+            raise ValueError("Guest WiFi requires an explicit boolean and bands")
+        if any(
+            re.fullmatch(r"band[0-9]+(?:_[0-9]+)*", band) is None
+            for band in band_names
+        ) or len(set(band_names)) != len(band_names):
+            raise ValueError("Guest WiFi band selection is invalid")
+
+        await self.async_login_if_needed()
+        context = "Set wireless guest network"
+        payload = {
+            "operation": "write",
+            "params": {
+                band: {"guest": {"enable": enabled}} for band in band_names
+            },
+        }
+        # Never retry a write after a timeout or an ambiguous transport failure.
+        failure = False
+        try:
+            response = await self._async_post(
+                context,
+                f"{self._host}/cgi-bin/luci/;stok={self._stok}/admin/wireless",
+                params={"form": "wlan"},
+                data=self._encode_payload(payload),
+            )
+            encrypted = response.get("data") if isinstance(response, dict) else None
+            if not isinstance(encrypted, str) or not encrypted:
+                failure = True
+            else:
+                result = self._decrypt_data("Get wireless status", encrypted)
+                if not isinstance(result, dict):
+                    failure = True
+                else:
+                    status = result.get("error_code", result.get("errorcode"))
+                    failure = type(status) is not int or status != 0
+        except Exception:
+            failure = True
+        if failure:
+            raise UnexpectedApiException(
+                "Guest WiFi change was not confirmed; refresh the router state"
+            )
+
     async def async_get_mobile_data_usage(self) -> int | None:
         """Read optional mobile WAN usage in KiB without extra timeout retries."""
         return await self._async_call_with_retry(
