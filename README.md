@@ -97,6 +97,22 @@ Recorder can retain it in history and backups. The sensor displays up to
 255 characters on one line and becomes unavailable when the message clears.
 The integration omits the message from its logs and diagnostics download.
 
+### Guest WiFi switch (experimental; firmware verification pending)
+
+The **Guest WiFi** switch is associated with the master Deco and appears only
+after the firmware reports a recognized guest-network state. It is distinct
+from the existing read-only Guest WiFi binary sensor. Turning it on or off
+re-reads the guest bands and sends only their `enable` flags through the
+encrypted local Deco API; it does not send network names or passwords.
+Changes are never sent at startup or during normal polling. If the master
+changes, the WLAN fields are unsupported or the router does not confirm the
+new state, the command fails rather than reporting a fictitious success.
+
+**Important:** Exact partial-write behavior and encrypted write acknowledgements
+have not been verified on physical TP-Link Deco firmware. Do not rely on this
+experimental switch until the particular router model and firmware have been
+tested, especially when the guest WiFi network is in active use.
+
 ### Optional mobile WAN data usage (upstream #631)
 
 On supported Deco 4G/5G router models, a **Mobile data usage** sensor

@@ -180,6 +180,11 @@
       "reboot_all": {
         "name": "Alle Deco’s opnieuw opstarten"
       }
+    },
+    "switch": {
+      "guest_wifi": {
+        "name": "Gastnetwerk"
+      }
     }
   }
 }

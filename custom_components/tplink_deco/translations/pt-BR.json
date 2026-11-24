@@ -191,6 +191,11 @@
       "reboot_all": {
         "name": "Reiniciar todos os Decos"
       }
+    },
+    "switch": {
+      "guest_wifi": {
+        "name": "Wi-Fi para convidados"
+      }
     }
   }
 }
