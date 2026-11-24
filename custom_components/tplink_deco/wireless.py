@@ -263,10 +263,16 @@ class TplinkDecoWirelessUpdateCoordinator(DataUpdateCoordinator[dict[str, bool]]
                 raise UpdateFailed("Guest WiFi is not available on the current master")
 
             # A fresh authenticated read validates all target sections before writing.
+            read_failed = False
             try:
                 config = await self.api.async_get_wireless()
+            except ConfigEntryAuthFailed:
+                raise
             except Exception:
-                raise UpdateFailed("Unable to verify guest WiFi settings") from None
+                read_failed = True
+                config = None
+            if read_failed:
+                raise UpdateFailed("Unable to verify guest WiFi settings")
             if (current_mac, generation) != self._observe_master():
                 raise UpdateFailed("Master Deco changed during guest WiFi validation")
             if not isinstance(config, dict):
@@ -279,13 +285,19 @@ class TplinkDecoWirelessUpdateCoordinator(DataUpdateCoordinator[dict[str, bool]]
                 raise UpdateFailed("Guest WiFi band states are not supported")
 
             selected_bands = tuple(sorted(band for band, _ in bands))
+            write_failed = False
             try:
                 await self.api.async_set_guest_wireless(selected_bands, enabled)
+            except ConfigEntryAuthFailed:
+                raise
             except Exception:
-                # A router may have applied the write before an uncertain failure.
+                # Never carry raw API errors into Home Assistant diagnostics.
+                write_failed = True
+            if write_failed:
+                # A router may have applied a write before an uncertain failure.
                 raise UpdateFailed(
                     "Guest WiFi change could not be confirmed; check router state"
-                ) from None
+                )
             if (current_mac, generation) != self._observe_master():
                 raise UpdateFailed("Master Deco changed during guest WiFi update")
             await self.async_refresh()
