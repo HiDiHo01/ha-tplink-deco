@@ -133,3 +133,29 @@ def test_guest_switch_preserves_distinct_entity_id() -> None:
     assert entity.unique_id == f"{MASTER}_guest_wifi_switch"
     assert entity.is_on is True
     assert entity.available is True
+
+
+@pytest.mark.asyncio
+async def test_guest_write_rejects_failed_readback() -> None:
+    """Never claim success when router readback contradicts the command."""
+    wireless = _coordinator()
+    wireless.data = {"guest": False}
+    with pytest.raises(UpdateFailed, match="could not be verified"):
+        await wireless.async_set_guest_enabled(True, MASTER)
+    wireless.api.async_set_guest_wireless.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_guest_write_rejects_master_handover_during_preflight() -> None:
+    """Discard stale wireless settings after an A -> B -> A handover."""
+    wireless = _coordinator()
+
+    async def changed_master() -> dict[str, object]:
+        """Simulate a master generation invalidation during an awaited read."""
+        wireless._master_generation += 1
+        return {"band2_4": {"guest": {"enable": True}}}
+
+    wireless.api.async_get_wireless.side_effect = changed_master
+    with pytest.raises(UpdateFailed, match="Master Deco changed"):
+        await wireless.async_set_guest_enabled(False, MASTER)
+    wireless.api.async_set_guest_wireless.assert_not_awaited()
