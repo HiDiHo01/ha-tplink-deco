@@ -1,5 +1,6 @@
-"""Read-only WiFi network status for supported TP-Link Deco firmware."""
+"""Read WiFi status and validate explicit guest-network control actions."""
 
+import asyncio
 from dataclasses import dataclass
 from datetime import timedelta
 import logging
@@ -13,12 +14,15 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.core import callback
 from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.helpers.update_coordinator import UpdateFailed
 
 from .api import TplinkDecoApi
 from .api import decode_name_with_fallback
 from .const import ATTR_SSID
+from .const import COORDINATOR_WIRELESS_KEY
 from .const import DOMAIN
 from .coordinator import TplinkDecoUpdateCoordinator
 from .coordinator import async_call_and_propagate_config_error
@@ -160,6 +164,36 @@ def parse_wireless_ssids(config: object) -> dict[str, dict[str, str]]:
     return ssids
 
 
+def parse_guest_wifi_bands(config: object) -> dict[str, bool]:
+    """Validate every supported guest band before constructing a write."""
+    if not isinstance(config, dict):
+        raise ValueError("Guest WiFi response must be a mapping")
+
+    bands: dict[str, bool] = {}
+    for key, section in config.items():
+        if not isinstance(key, str) or not key.startswith("band"):
+            continue
+        if not isinstance(section, dict):
+            raise ValueError("Guest WiFi band settings are malformed")
+        guest = section.get("guest")
+        if guest is None:
+            continue
+        if (
+            len(key) > MAX_SSID_BAND_KEY_LENGTH
+            or SSID_BAND_KEY_PATTERN.fullmatch(key) is None
+            or not isinstance(guest, dict)
+        ):
+            raise ValueError("Guest WiFi band settings are unsupported")
+        enabled = _parse_enabled(guest.get("enable"))
+        if enabled is None:
+            raise ValueError("Guest WiFi enable flag is missing or invalid")
+        bands[key] = enabled
+
+    if not bands:
+        raise ValueError("Guest WiFi is unsupported by this Deco firmware")
+    return bands
+
+
 def wireless_ssid_attributes(names: dict[str, str]) -> dict[str, str]:
     """Expose a common name once, or individual names per band."""
     if not names:
@@ -200,6 +234,8 @@ class TplinkDecoWirelessUpdateCoordinator(DataUpdateCoordinator[dict[str, bool]]
         self._ssid_master_generation: int | None = None
         self._next_retry = 0.0
         self._consecutive_failures = 0
+        self._guest_write_lock = asyncio.Lock()
+        self._guest_write_uncertain = False
         if config_entry is not None:
             config_entry.async_on_unload(
                 deco_coordinator.async_add_listener(self._handle_deco_update)
@@ -244,6 +280,98 @@ class TplinkDecoWirelessUpdateCoordinator(DataUpdateCoordinator[dict[str, bool]]
         ):
             return {}
         return self.ssids.get(network_key, {})
+
+    @callback
+    def guest_write_generation(self, master_mac: str) -> int | None:
+        """Require a fresh supported guest network on this entry's master."""
+        current_mac, generation = self._observe_master()
+        data = self._deco_coordinator.data
+        confirmed_master = getattr(data, "confirmed_online_master", None)
+        if (
+            current_mac != master_mac
+            or confirmed_master is None
+            or confirmed_master.mac != master_mac
+            or not self._deco_coordinator.last_update_success
+            or self._deco_coordinator.paused
+            or not self.last_update_success
+            or not isinstance(self.data, dict)
+            or type(self.data.get("guest")) is not bool
+            or self._guest_write_uncertain
+            or self.config_entry is None
+        ):
+            return None
+        active = self.hass.data.get(DOMAIN, {}).get(self.config_entry.entry_id, {})
+        if active.get(COORDINATOR_WIRELESS_KEY) is not self:
+            return None
+        return generation
+
+    async def async_set_guest_network(self, master_mac: str, enabled: bool) -> None:
+        """Write only validated guest flags and publish verified readback."""
+        if type(enabled) is not bool:
+            raise ServiceValidationError("Guest WiFi state must be on or off")
+        if self._guest_write_lock.locked():
+            raise ServiceValidationError("A guest WiFi change is already in progress")
+
+        async with self._guest_write_lock:
+            generation = self.guest_write_generation(master_mac)
+            if generation is None:
+                raise ServiceValidationError(
+                    "Guest WiFi is unavailable; check the master and WiFi status"
+                )
+
+            failure: str | None = None
+            try:
+                current_config = await self.api.async_get_wireless()
+                bands = parse_guest_wifi_bands(current_config)
+            except Exception:
+                failure = "Unable to verify supported guest WiFi bands"
+            if failure is not None:
+                raise HomeAssistantError(failure)
+            if self.guest_write_generation(master_mac) != generation:
+                raise ServiceValidationError(
+                    "Guest WiFi master or network changed during validation"
+                )
+
+            if all(state is enabled for state in bands.values()):
+                return
+
+            # An accepted write may lose its acknowledgement; never retry it
+            # automatically or publish an optimistic enabled state.
+            self._guest_write_uncertain = True
+            try:
+                await self.api.async_set_guest_wifi(tuple(sorted(bands)), enabled)
+                current_config = await self.api.async_get_wireless()
+                observed = parse_guest_wifi_bands(current_config)
+                if (
+                    self._observe_master() != (master_mac, generation)
+                    or set(observed) != set(bands)
+                ):
+                    raise ValueError("Guest WiFi master or bands changed")
+                states = parse_wireless_states(current_config)
+                names = (
+                    {
+                        key: values
+                        for key, values in parse_wireless_ssids(current_config).items()
+                        if key in states
+                    }
+                    if self.expose_ssids
+                    else {}
+                )
+            except Exception:
+                failure = "Guest WiFi update or subsequent verification failed"
+            else:
+                self.ssids = names
+                self._ssid_master_mac = master_mac if self.expose_ssids else None
+                self._ssid_master_generation = (
+                    generation if self.expose_ssids else None
+                )
+                self._guest_write_uncertain = False
+                self.reset_retry()
+                self.async_set_updated_data(states)
+                if any(value is not enabled for value in observed.values()):
+                    failure = "Guest WiFi did not reach the requested state"
+            if failure is not None:
+                raise HomeAssistantError(failure)
 
     @property
     def retry_remaining_seconds(self) -> int:
