@@ -124,6 +124,7 @@ class DecoGuestWifiSwitch(CoordinatorEntity, SwitchEntity):
 
     _attr_has_entity_name = True
     _attr_name = "Guest WiFi"
+    _attr_translation_key = "guest_wifi"
     _attr_icon = "mdi:wifi-lock-open"
 
     def __init__(
