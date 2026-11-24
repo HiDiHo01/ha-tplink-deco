@@ -4,8 +4,8 @@ import asyncio
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
 
-import pytest
 from homeassistant.helpers.update_coordinator import UpdateFailed
+import pytest
 
 from custom_components.tplink_deco.api import TplinkDecoApi
 from custom_components.tplink_deco.switch import DecoGuestWifiSwitch
@@ -26,13 +26,15 @@ async def test_guest_write_uses_only_encrypted_guest_enable_fields() -> None:
 
     await api.async_set_guest_wireless(("band2_4", "band5_1"), True)
 
-    api._encode_payload.assert_called_once_with({
-        "operation": "write",
-        "params": {
-            "band2_4": {"guest": {"enable": True}},
-            "band5_1": {"guest": {"enable": True}},
-        },
-    })
+    api._encode_payload.assert_called_once_with(
+        {
+            "operation": "write",
+            "params": {
+                "band2_4": {"guest": {"enable": True}},
+                "band5_1": {"guest": {"enable": True}},
+            },
+        }
+    )
     api._async_post.assert_awaited_once_with(
         "Set wireless guest network",
         "https://192.0.2.1/cgi-bin/luci/;stok=synthetic/admin/wireless",
@@ -76,10 +78,12 @@ def _coordinator() -> TplinkDecoWirelessUpdateCoordinator:
     wireless = object.__new__(TplinkDecoWirelessUpdateCoordinator)
     wireless._guest_write_lock = asyncio.Lock()
     wireless.api = MagicMock()
-    wireless.api.async_get_wireless = AsyncMock(return_value={
-        "band2_4": {"guest": {"enable": True}},
-        "band5_1": {"guest": {"enable": False}},
-    })
+    wireless.api.async_get_wireless = AsyncMock(
+        return_value={
+            "band2_4": {"guest": {"enable": True}},
+            "band5_1": {"guest": {"enable": False}},
+        }
+    )
     wireless.api.async_set_guest_wireless = AsyncMock()
     wireless._deco_coordinator = MagicMock(paused=False)
     wireless._deco_coordinator.data.master_deco.mac = MASTER
