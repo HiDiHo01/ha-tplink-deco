@@ -281,7 +281,9 @@ class TplinkDecoWirelessUpdateCoordinator(DataUpdateCoordinator[dict[str, bool]]
             bands = _resolve_band_sections(config, (("band*", "guest"),))
             if not bands or len({band for band, _ in bands}) != len(bands):
                 raise UpdateFailed("Guest WiFi bands are unsupported or ambiguous")
-            if any(_parse_enabled(section.get("enable")) is None for _, section in bands):
+            if any(
+                _parse_enabled(section.get("enable")) is None for _, section in bands
+            ):
                 raise UpdateFailed("Guest WiFi band states are not supported")
 
             selected_bands = tuple(sorted(band for band, _ in bands))
